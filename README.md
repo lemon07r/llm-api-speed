@@ -10,6 +10,8 @@ A fast, concurrent benchmarking tool for measuring LLM API performance metrics a
 - **Real Metrics**: Measures End-to-End Latency, Time to First Token (TTFT), and Throughput
 - **Accurate Token Counting**: Uses tiktoken for precise token measurements
 - **Multi-Run Averaging**: Runs 3 concurrent iterations per provider and averages results for more reliable metrics
+- **Multiple Test Modes**: Streaming, tool-calling, and mixed modes for comprehensive testing
+- **Diagnostic Mode**: 1-minute stress test with 10 concurrent workers for in-depth performance analysis
 - **Session-Based Organization**: Each test run creates its own timestamped folder with logs and results
 - **Markdown Reports**: Auto-generates performance summaries with leaderboards and failure analysis
 - **Timeout Protection**: 2-minute timeout prevents indefinite hangs on stuck providers
@@ -63,6 +65,8 @@ cp example.env .env
 
 ## Usage
 
+### Basic Usage
+
 ```bash
 # Generic provider with custom API endpoint
 ./llm-api-speed --url https://api.openai.com/v1 --model gpt-4
@@ -77,6 +81,63 @@ cp example.env .env
 # Test all configured providers concurrently
 ./llm-api-speed --all
 ```
+
+### Test Modes
+
+The tool supports three different test modes to measure different aspects of API performance:
+
+#### Streaming Mode (Default)
+Tests regular chat completion with streaming responses. This is the default mode.
+
+```bash
+# Explicit streaming mode (default behavior)
+./llm-api-speed --provider nim
+```
+
+#### Tool-Calling Mode
+Tests the API's tool/function calling capabilities with streaming. Measures performance when the model needs to generate tool calls.
+
+```bash
+# Test tool-calling performance
+./llm-api-speed --provider nim --tool-calling
+```
+
+#### Mixed Mode
+Runs 3 iterations of both streaming and tool-calling modes (6 total runs). Provides comprehensive performance metrics for both use cases.
+
+```bash
+# Test both streaming and tool-calling
+./llm-api-speed --provider nim --mixed
+
+# Test all providers with both modes
+./llm-api-speed --all --mixed
+```
+
+### Diagnostic Mode
+
+Diagnostic mode runs intensive stress testing with 10 concurrent workers for 1 minute, making requests every 15 seconds with a 30-second timeout per request. Perfect for:
+- Load testing your API endpoints
+- Identifying rate limits and throttling behavior
+- Measuring performance under sustained concurrent load
+- Debugging intermittent issues
+
+```bash
+# Run diagnostic mode with streaming
+./llm-api-speed --provider nim --diagnostic
+
+# Run diagnostic mode with tool-calling
+./llm-api-speed --provider nim --diagnostic --tool-calling
+
+# Run diagnostic mode with mixed workload (alternates between streaming and tool-calling)
+./llm-api-speed --provider nim --diagnostic --mixed
+```
+
+Diagnostic mode produces:
+- Detailed per-request logs for each worker
+- Aggregated success/failure statistics
+- Average metrics across all successful requests
+- Error frequency analysis
+- JSON summary file with all metrics
 
 ## Output
 

@@ -38,7 +38,17 @@ type TestResult struct {
 	CompletionTokens int           `json:"completion_tokens"`
 	Success          bool          `json:"success"`
 	Error            string        `json:"error,omitempty"`
+	Mode             string        `json:"mode"`
 }
+
+// TestMode represents the type of test being performed
+type TestMode string
+
+const (
+	ModeStreaming   TestMode = "streaming"
+	ModeToolCalling TestMode = "tool-calling"
+	ModeMixed       TestMode = "mixed"
+)
 
 // formatDuration formats a duration as decimal seconds
 func formatDuration(d time.Duration) string {
@@ -147,9 +157,150 @@ func singleTestRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger
 	return e2eLatency, ttftLatency, throughputVal, completionTokens, nil
 }
 
+// singleToolCallRun performs one tool-calling test run and returns metrics or error
+func singleToolCallRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger *log.Logger, ctx context.Context) (e2e, ttft time.Duration, throughput float64, tokens int, err error) {
+	// Configure the OpenAI Client
+	clientConfig := openai.DefaultConfig(config.APIKey)
+	clientConfig.BaseURL = config.BaseURL
+	client := openai.NewClientWithConfig(clientConfig)
+
+	// Define a weather tool
+	tools := []openai.Tool{
+		{
+			Type: openai.ToolTypeFunction,
+			Function: &openai.FunctionDefinition{
+				Name:        "get_weather",
+				Description: "Get the current weather in a given location",
+				Parameters: map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"location": map[string]interface{}{
+							"type":        "string",
+							"description": "The city and state, e.g. San Francisco, CA",
+						},
+						"unit": map[string]interface{}{
+							"type": "string",
+							"enum": []string{"celsius", "fahrenheit"},
+						},
+					},
+					"required": []string{"location"},
+				},
+			},
+		},
+	}
+
+	prompt := "What's the weather like in San Francisco, Tokyo, and London? Please check all three cities and tell me which one has the best weather for outdoor activities today."
+	messages := []openai.ChatCompletionMessage{
+		{
+			Role:    openai.ChatMessageRoleUser,
+			Content: prompt,
+		},
+	}
+
+	req := openai.ChatCompletionRequest{
+		Model:     config.Model,
+		Messages:  messages,
+		Tools:     tools,
+		MaxTokens: 512,
+		Stream:    true,
+	}
+
+	// Execute the stream and measure metrics
+	startTime := time.Now()
+	var firstTokenTime time.Time
+	var fullResponseContent strings.Builder
+
+	stream, streamErr := client.CreateChatCompletionStream(ctx, req)
+	if streamErr != nil {
+		return 0, 0, 0, 0, fmt.Errorf("error creating stream: %w", streamErr)
+	}
+	defer stream.Close()
+
+	providerLogger.Printf("[%s] ... Tool calling request sent. Waiting for stream ...", config.Name)
+
+	for {
+		response, recvErr := stream.Recv()
+
+		// Check for end of stream
+		if errors.Is(recvErr, io.EOF) {
+			providerLogger.Printf("[%s] ... Tool calling stream complete.", config.Name)
+			break
+		}
+
+		if recvErr != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				return 0, 0, 0, 0, fmt.Errorf("timeout exceeded")
+			}
+			return 0, 0, 0, 0, fmt.Errorf("stream error: %w", recvErr)
+		}
+
+		// Check if Choices array is empty
+		if len(response.Choices) == 0 {
+			continue
+		}
+
+		choice := response.Choices[0]
+
+		// Check for first token (either content or tool call)
+		hasContent := choice.Delta.Content != ""
+		hasToolCall := len(choice.Delta.ToolCalls) > 0
+
+		if (hasContent || hasToolCall) && firstTokenTime.IsZero() {
+			firstTokenTime = time.Now()
+			providerLogger.Printf("[%s] ... First token received (tool-calling)!", config.Name)
+		}
+
+		// Append content if present
+		if hasContent {
+			fullResponseContent.WriteString(choice.Delta.Content)
+		}
+
+		// Append tool call information as text for token counting
+		if hasToolCall {
+			for _, toolCall := range choice.Delta.ToolCalls {
+				if toolCall.Function.Name != "" {
+					fullResponseContent.WriteString(toolCall.Function.Name)
+				}
+				if toolCall.Function.Arguments != "" {
+					fullResponseContent.WriteString(toolCall.Function.Arguments)
+				}
+			}
+		}
+	}
+
+	endTime := time.Now()
+
+	if firstTokenTime.IsZero() {
+		return 0, 0, 0, 0, fmt.Errorf("no content received from API")
+	}
+
+	// Get accurate token count
+	fullResponse := fullResponseContent.String()
+	tokenList := tke.Encode(fullResponse, nil, nil)
+	completionTokens := len(tokenList)
+
+	if completionTokens == 0 {
+		return 0, 0, 0, 0, fmt.Errorf("received 0 tokens")
+	}
+
+	// Calculate metrics
+	e2eLatency := endTime.Sub(startTime)
+	ttftLatency := firstTokenTime.Sub(startTime)
+	generationTime := e2eLatency - ttftLatency
+
+	var throughputVal float64
+	if generationTime.Seconds() <= 0 {
+		throughputVal = 0.0
+	} else {
+		throughputVal = (float64(completionTokens) - 1.0) / generationTime.Seconds()
+	}
+
+	return e2eLatency, ttftLatency, throughputVal, completionTokens, nil
+}
+
 // testProviderMetrics runs a full benchmark test against a single provider.
 // It runs 3 iterations and reports averaged results, with a 2-minute total timeout.
-func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync.WaitGroup, logDir, resultsDir string, results *[]TestResult, resultsMutex *sync.Mutex) {
+func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync.WaitGroup, logDir, resultsDir string, results *[]TestResult, resultsMutex *sync.Mutex, mode TestMode) {
 	// Defer wg.Done() if this is part of a concurrent group
 	if wg != nil {
 		defer wg.Done()
@@ -167,14 +318,23 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 	// Create a logger for this provider that writes to both stdout and file
 	providerLogger := log.New(io.MultiWriter(os.Stdout, logFile), "", log.LstdFlags)
 
-	providerLogger.Printf("--- Testing: %s (%s) - Running 3 concurrent iterations ---", config.Name, config.Model)
+	modeStr := string(mode)
+	providerLogger.Printf("--- Testing: %s (%s) - Mode: %s - Running 3 concurrent iterations ---", config.Name, config.Model, modeStr)
 
 	// Create 2-minute timeout context for all runs
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	// Run 3 iterations concurrently
-	const maxIterations = 3
+	// Determine which modes to run based on mode parameter
+	var modesToRun []TestMode
+	if mode == ModeMixed {
+		modesToRun = []TestMode{ModeStreaming, ModeToolCalling}
+	} else {
+		modesToRun = []TestMode{mode}
+	}
+
+	// Run 3 iterations per mode
+	const iterationsPerMode = 3
 	type runResult struct {
 		e2e        time.Duration
 		ttft       time.Duration
@@ -182,36 +342,53 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 		tokens     int
 		err        error
 		runNum     int
+		mode       TestMode
 	}
 
-	resultsChan := make(chan runResult, maxIterations)
+	totalRuns := len(modesToRun) * iterationsPerMode
+	resultsChan := make(chan runResult, totalRuns)
 	var runWg sync.WaitGroup
 
-	// Launch concurrent workers
-	for i := 1; i <= maxIterations; i++ {
-		runWg.Add(1)
-		go func(runNum int) {
-			defer runWg.Done()
-			providerLogger.Printf("[%s] Run %d/%d starting", config.Name, runNum, maxIterations)
+	// Launch concurrent workers for each mode
+	runNum := 1
+	for _, testMode := range modesToRun {
+		for i := 1; i <= iterationsPerMode; i++ {
+			runWg.Add(1)
+			go func(currentRunNum int, currentMode TestMode, iteration int) {
+				defer runWg.Done()
+				providerLogger.Printf("[%s] Run %d/%d (%s) starting", config.Name, currentRunNum, totalRuns, currentMode)
 
-			e2e, ttft, throughput, tokens, runErr := singleTestRun(config, tke, providerLogger, ctx)
+				var e2e, ttft time.Duration
+				var throughput float64
+				var tokens int
+				var runErr error
 
-			if runErr != nil {
-				providerLogger.Printf("[%s] Run %d failed: %v", config.Name, runNum, runErr)
-			} else {
-				providerLogger.Printf("[%s] Run %d complete: E2E=%s TTFT=%s Throughput=%.2f tok/s",
-					config.Name, runNum, formatDuration(e2e), formatDuration(ttft), throughput)
-			}
+				// Execute the appropriate test based on mode
+				if currentMode == ModeToolCalling {
+					e2e, ttft, throughput, tokens, runErr = singleToolCallRun(config, tke, providerLogger, ctx)
+				} else {
+					e2e, ttft, throughput, tokens, runErr = singleTestRun(config, tke, providerLogger, ctx)
+				}
 
-			resultsChan <- runResult{
-				e2e:        e2e,
-				ttft:       ttft,
-				throughput: throughput,
-				tokens:     tokens,
-				err:        runErr,
-				runNum:     runNum,
-			}
-		}(i)
+				if runErr != nil {
+					providerLogger.Printf("[%s] Run %d (%s) failed: %v", config.Name, currentRunNum, currentMode, runErr)
+				} else {
+					providerLogger.Printf("[%s] Run %d (%s) complete: E2E=%s TTFT=%s Throughput=%.2f tok/s",
+						config.Name, currentRunNum, currentMode, formatDuration(e2e), formatDuration(ttft), throughput)
+				}
+
+				resultsChan <- runResult{
+					e2e:        e2e,
+					ttft:       ttft,
+					throughput: throughput,
+					tokens:     tokens,
+					err:        runErr,
+					runNum:     currentRunNum,
+					mode:       currentMode,
+				}
+			}(runNum, testMode, i)
+			runNum++
+		}
 	}
 
 	// Close channel after all workers complete
@@ -248,6 +425,7 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 			Timestamp: time.Now(),
 			Success:   false,
 			Error:     firstError.Error(),
+			Mode:      modeStr,
 		}
 		saveResult(resultsDir, result)
 		appendResult(results, resultsMutex, result)
@@ -264,6 +442,7 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 	providerLogger.Println("==============================================")
 	providerLogger.Printf("   LLM Metrics for: %s (averaged over %d run(s))", config.Name, successfulRuns)
 	providerLogger.Printf("   Model: %s", config.Model)
+	providerLogger.Printf("   Mode: %s", modeStr)
 	providerLogger.Printf("   Avg Output Tokens: %d", avgTokens)
 	providerLogger.Println("----------------------------------------------")
 	providerLogger.Printf("   End-to-End Latency: %s", formatDuration(avgE2E))
@@ -281,6 +460,7 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 		Throughput:       avgThroughput,
 		CompletionTokens: avgTokens,
 		Success:          true,
+		Mode:             modeStr,
 	}
 	saveResult(resultsDir, result)
 	appendResult(results, resultsMutex, result)
@@ -342,14 +522,15 @@ func generateMarkdownReport(resultsDir string, results []TestResult, sessionTime
 	// Successful results table
 	if successful > 0 {
 		report.WriteString("## Successful Tests\n\n")
-		report.WriteString("| Provider | Model | E2E Latency | TTFT | Throughput | Tokens |\n")
-		report.WriteString("|----------|-------|-------------|------|------------|--------|\n")
+		report.WriteString("| Provider | Model | Mode | E2E Latency | TTFT | Throughput | Tokens |\n")
+		report.WriteString("|----------|-------|------|-------------|------|------------|--------|\n")
 
 		for _, r := range results {
 			if r.Success {
-				report.WriteString(fmt.Sprintf("| %s | %s | %s | %s | %.2f tok/s | %d |\n",
+				report.WriteString(fmt.Sprintf("| %s | %s | %s | %s | %s | %.2f tok/s | %d |\n",
 					r.Provider,
 					r.Model,
+					r.Mode,
 					formatDuration(r.E2ELatency),
 					formatDuration(r.TTFT),
 					r.Throughput,
@@ -362,14 +543,15 @@ func generateMarkdownReport(resultsDir string, results []TestResult, sessionTime
 	// Failed results
 	if failed > 0 {
 		report.WriteString("## Failed Tests\n\n")
-		report.WriteString("| Provider | Model | Error |\n")
-		report.WriteString("|----------|-------|-------|\n")
+		report.WriteString("| Provider | Model | Mode | Error |\n")
+		report.WriteString("|----------|-------|------|-------|\n")
 
 		for _, r := range results {
 			if !r.Success {
-				report.WriteString(fmt.Sprintf("| %s | %s | %s |\n",
+				report.WriteString(fmt.Sprintf("| %s | %s | %s | %s |\n",
 					r.Provider,
 					r.Model,
+					r.Mode,
 					r.Error))
 			}
 		}
@@ -471,6 +653,199 @@ func generateMarkdownReport(resultsDir string, results []TestResult, sessionTime
 	return nil
 }
 
+// diagnosticMode runs continuous testing with 10 workers for 1 minute
+// Makes 10 requests every 15 seconds, with 30-second timeout per request
+func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resultsDir string, mode TestMode) {
+	timestamp := time.Now().Format("20060102-150405")
+	logFile, err := os.Create(filepath.Join(logDir, fmt.Sprintf("%s-diagnostic-%s.log", config.Name, timestamp)))
+	if err != nil {
+		log.Printf("Error creating diagnostic log file for %s: %v", config.Name, err)
+		return
+	}
+	defer logFile.Close()
+
+	providerLogger := log.New(io.MultiWriter(os.Stdout, logFile), "", log.LstdFlags)
+	providerLogger.Printf("=== DIAGNOSTIC MODE: %s (%s) - Mode: %s ===", config.Name, config.Model, mode)
+	providerLogger.Printf("Running 10 workers for 1 minute with requests every 15 seconds")
+	providerLogger.Printf("Timeout per request: 30 seconds")
+
+	// Create a 1-minute timeout for the entire diagnostic session
+	sessionCtx, sessionCancel := context.WithTimeout(context.Background(), 1*time.Minute)
+	defer sessionCancel()
+
+	// Metrics tracking
+	type diagnosticResult struct {
+		workerID int
+		reqNum   int
+		e2e      time.Duration
+		ttft     time.Duration
+		tokens   int
+		err      error
+		mode     TestMode
+	}
+
+	resultsChan := make(chan diagnosticResult, 1000)
+	var wg sync.WaitGroup
+
+	// Start 10 workers
+	const numWorkers = 10
+	for workerID := 1; workerID <= numWorkers; workerID++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			reqNum := 0
+
+			// Create ticker for requests every 15 seconds
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+
+			// Make first request immediately
+			for {
+				reqNum++
+				
+				// Create 30-second timeout context for this request
+				reqCtx, reqCancel := context.WithTimeout(sessionCtx, 30*time.Second)
+				
+				providerLogger.Printf("[Worker %d] Request #%d starting", id, reqNum)
+
+				var e2e, ttft time.Duration
+				var tokens int
+				var reqErr error
+
+				// Determine which test function to use based on mode
+				var testMode TestMode
+				if mode == ModeMixed {
+					// Alternate between streaming and tool-calling in mixed mode
+					if reqNum%2 == 1 {
+						testMode = ModeStreaming
+						e2e, ttft, _, tokens, reqErr = singleTestRun(config, tke, providerLogger, reqCtx)
+					} else {
+						testMode = ModeToolCalling
+						e2e, ttft, _, tokens, reqErr = singleToolCallRun(config, tke, providerLogger, reqCtx)
+					}
+				} else if mode == ModeToolCalling {
+					testMode = ModeToolCalling
+					e2e, ttft, _, tokens, reqErr = singleToolCallRun(config, tke, providerLogger, reqCtx)
+				} else {
+					testMode = ModeStreaming
+					e2e, ttft, _, tokens, reqErr = singleTestRun(config, tke, providerLogger, reqCtx)
+				}
+
+				reqCancel()
+
+				if reqErr != nil {
+					providerLogger.Printf("[Worker %d] Request #%d (%s) failed: %v", id, reqNum, testMode, reqErr)
+				} else {
+					providerLogger.Printf("[Worker %d] Request #%d (%s) success: E2E=%s TTFT=%s Tokens=%d",
+						id, reqNum, testMode, formatDuration(e2e), formatDuration(ttft), tokens)
+				}
+
+				resultsChan <- diagnosticResult{
+					workerID: id,
+					reqNum:   reqNum,
+					e2e:      e2e,
+					ttft:     ttft,
+					tokens:   tokens,
+					err:      reqErr,
+					mode:     testMode,
+				}
+
+				// Wait for next tick or session end
+				select {
+				case <-sessionCtx.Done():
+					providerLogger.Printf("[Worker %d] Session ended, completed %d requests", id, reqNum)
+					return
+				case <-ticker.C:
+					// Continue to next request
+				}
+			}
+		}(workerID)
+	}
+
+	// Wait for all workers to complete
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+
+	// Collect and aggregate results
+	var successCount, failureCount int
+	var totalE2E, totalTTFT time.Duration
+	var totalTokens int
+	errors := make(map[string]int)
+
+	for result := range resultsChan {
+		if result.err != nil {
+			failureCount++
+			errors[result.err.Error()]++
+		} else {
+			successCount++
+			totalE2E += result.e2e
+			totalTTFT += result.ttft
+			totalTokens += result.tokens
+		}
+	}
+
+	// Print summary
+	providerLogger.Println("")
+	providerLogger.Println("========================================")
+	providerLogger.Println("   DIAGNOSTIC MODE SUMMARY")
+	providerLogger.Println("========================================")
+	providerLogger.Printf("Provider: %s", config.Name)
+	providerLogger.Printf("Model: %s", config.Model)
+	providerLogger.Printf("Mode: %s", mode)
+	providerLogger.Printf("Total Requests: %d", successCount+failureCount)
+	providerLogger.Printf("Successful: %d", successCount)
+	providerLogger.Printf("Failed: %d", failureCount)
+
+	if successCount > 0 {
+		avgE2E := totalE2E / time.Duration(successCount)
+		avgTTFT := totalTTFT / time.Duration(successCount)
+		avgTokens := totalTokens / successCount
+
+		providerLogger.Println("--------------------------------------")
+		providerLogger.Printf("Average E2E Latency: %s", formatDuration(avgE2E))
+		providerLogger.Printf("Average TTFT: %s", formatDuration(avgTTFT))
+		providerLogger.Printf("Average Tokens: %d", avgTokens)
+	}
+
+	if len(errors) > 0 {
+		providerLogger.Println("--------------------------------------")
+		providerLogger.Println("Errors encountered:")
+		for errMsg, count := range errors {
+			providerLogger.Printf("  - %s (x%d)", errMsg, count)
+		}
+	}
+
+	providerLogger.Println("========================================")
+
+	// Save diagnostic summary
+	summaryFile := filepath.Join(resultsDir, fmt.Sprintf("%s-diagnostic-summary-%s.json", config.Name, timestamp))
+	summary := map[string]interface{}{
+		"provider":         config.Name,
+		"model":            config.Model,
+		"mode":             string(mode),
+		"total_requests":   successCount + failureCount,
+		"successful":       successCount,
+		"failed":           failureCount,
+		"timestamp":        time.Now(),
+	}
+
+	if successCount > 0 {
+		summary["avg_e2e_latency"] = (totalE2E / time.Duration(successCount)).String()
+		summary["avg_ttft"] = (totalTTFT / time.Duration(successCount)).String()
+		summary["avg_tokens"] = totalTokens / successCount
+	}
+
+	if len(errors) > 0 {
+		summary["errors"] = errors
+	}
+
+	data, _ := json.MarshalIndent(summary, "", "  ")
+	os.WriteFile(summaryFile, data, 0644)
+	providerLogger.Printf("Diagnostic summary saved: %s", summaryFile)
+}
+
 func main() {
 	// --- Define Provider static info ---
 	providerBaseURLs := map[string]string{
@@ -492,6 +867,9 @@ func main() {
 	testAll := flag.Bool("all", false, "Test all configured providers concurrently.")
 	flagGenericURL := flag.String("url", "", "Override Base URL for 'generic' provider (default: https://openrouter.ai/api/v1)")
 	flagGenericModel := flag.String("model", "", "Model name for 'generic' provider (required if --provider is not set)")
+	toolCalling := flag.Bool("tool-calling", false, "Use tool calling mode instead of regular streaming")
+	mixed := flag.Bool("mixed", false, "Run both streaming and tool-calling modes (3 runs each)")
+	diagnostic := flag.Bool("diagnostic", false, "Run diagnostic mode: 10 workers making requests every 15s for 1 minute with 30s timeout")
 	flag.Parse()
 
 	// 3. Create session-based folder structure
@@ -621,7 +999,29 @@ func main() {
 		log.Fatal("No providers configured or selected to test.")
 	}
 
+	// Determine test mode
+	var testMode TestMode
+	if *mixed {
+		testMode = ModeMixed
+		log.Println("Test mode: Mixed (streaming + tool-calling)")
+	} else if *toolCalling {
+		testMode = ModeToolCalling
+		log.Println("Test mode: Tool-calling")
+	} else {
+		testMode = ModeStreaming
+		log.Println("Test mode: Streaming")
+	}
+
 	// 6. Run Tests
+	if *diagnostic {
+		// Run diagnostic mode
+		log.Println("=== RUNNING IN DIAGNOSTIC MODE ===")
+		for _, provider := range providersToTest {
+			diagnosticMode(provider, tke, logDir, resultsDir, testMode)
+		}
+		log.Printf("Diagnostic tests complete. Results saved to: %s/", sessionDir)
+		return
+	}
 	var wg sync.WaitGroup
 	var results []TestResult
 	var resultsMutex sync.Mutex
@@ -630,10 +1030,10 @@ func main() {
 		if *testAll {
 			// Run all tests concurrently
 			wg.Add(1)
-			go testProviderMetrics(provider, tke, &wg, logDir, resultsDir, &results, &resultsMutex)
+			go testProviderMetrics(provider, tke, &wg, logDir, resultsDir, &results, &resultsMutex, testMode)
 		} else {
 			// Run a single test sequentially
-			testProviderMetrics(provider, tke, nil, logDir, resultsDir, &results, &resultsMutex)
+			testProviderMetrics(provider, tke, nil, logDir, resultsDir, &results, &resultsMutex, testMode)
 		}
 	}
 
