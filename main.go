@@ -223,9 +223,9 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 	providerLogger.Printf("   Model: %s", config.Model)
 	providerLogger.Printf("   Total Output Tokens: %d", completionTokens)
 	providerLogger.Println("----------------------------------------------")
-	providerLogger.Printf("   ⚡ End-to-End Latency: %v", e2eLatency)
-	providerLogger.Printf("   ⚡ Latency (TTFT):     %v", ttft)
-	providerLogger.Printf("   ⚡ Throughput (Tokens/sec): %.2f tokens/s", throughput)
+	providerLogger.Printf("   End-to-End Latency: %v", e2eLatency)
+	providerLogger.Printf("   Latency (TTFT):     %v", ttft)
+	providerLogger.Printf("   Throughput (Tokens/sec): %.2f tokens/s", throughput)
 	providerLogger.Println("==============================================")
 	// Uncomment to see the full response
 	// providerLogger.Printf("[%s] Full Response:\n%s\n", config.Name, fullResponse)
@@ -337,7 +337,7 @@ func generateMarkdownReport(resultsDir string, results []TestResult, sessionTime
 
 	// Leaderboard (sorted by throughput)
 	if successful > 0 {
-		report.WriteString("## 🏆 Performance Leaderboard\n\n")
+		report.WriteString("## Performance Leaderboard\n\n")
 		report.WriteString("### By Throughput (Tokens/sec)\n\n")
 
 		// Sort by throughput
@@ -391,6 +391,30 @@ func generateMarkdownReport(resultsDir string, results []TestResult, sessionTime
 				r.TTFT,
 				r.Throughput,
 				r.E2ELatency))
+		}
+		report.WriteString("\n")
+
+		// Sort by E2E Latency
+		report.WriteString("### By End-to-End Latency\n\n")
+
+		for i := 0; i < len(successfulResults); i++ {
+			for j := i + 1; j < len(successfulResults); j++ {
+				if successfulResults[j].E2ELatency < successfulResults[i].E2ELatency {
+					successfulResults[i], successfulResults[j] = successfulResults[j], successfulResults[i]
+				}
+			}
+		}
+
+		report.WriteString("| Rank | Provider | E2E Latency | TTFT | Throughput |\n")
+		report.WriteString("|------|----------|-------------|------|------------|\n")
+
+		for i, r := range successfulResults {
+			report.WriteString(fmt.Sprintf("| %d | %s | %v | %v | %.2f tok/s |\n",
+				i+1,
+				r.Provider,
+				r.E2ELatency,
+				r.TTFT,
+				r.Throughput))
 		}
 		report.WriteString("\n")
 	}
