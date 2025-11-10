@@ -135,9 +135,36 @@ Diagnostic mode runs intensive stress testing with 10 concurrent workers for 1 m
 Diagnostic mode produces:
 - Detailed per-request logs for each worker
 - Aggregated success/failure statistics
-- Average metrics across all successful requests
+- Average metrics (E2E latency, TTFT, throughput, tokens) across all successful requests
 - Error frequency analysis
 - JSON summary file with all metrics
+- Markdown report with leaderboards and error analysis (DIAGNOSTIC-REPORT.md)
+
+**Multiple Providers:** Diagnostic mode supports testing multiple providers concurrently:
+
+```bash
+# Test all providers in diagnostic mode
+./llm-api-speed --all --diagnostic --mixed
+```
+
+### Save Response Content
+
+Use the `--save-responses` flag to save all API response content to files in the logs directory:
+
+```bash
+# Save responses in normal mode
+./llm-api-speed --provider nim --save-responses
+
+# Save responses in diagnostic mode
+./llm-api-speed --provider nim --diagnostic --save-responses
+
+# Save responses for all providers
+./llm-api-speed --all --mixed --save-responses
+```
+
+Response files are saved with descriptive names:
+- **Normal mode:** `{provider}-run{N}-{mode}-response.txt`
+- **Diagnostic mode:** `{provider}-worker{N}-req{N}-{mode}-response.txt`
 
 ## Output
 
