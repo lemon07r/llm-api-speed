@@ -15,3 +15,7 @@ build/
 # PAMPAX
 .pampa/
 pampa.*
+
+# Logs
+logs/
+results/
