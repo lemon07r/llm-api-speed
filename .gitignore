@@ -11,3 +11,7 @@ build/
 # Markdown (except README)
 *.md
 !README.md
+
+# PAMPAX
+.pampa/
+pampa.*

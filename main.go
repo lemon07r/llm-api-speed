@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync" // Added for concurrent testing
 	"time"
@@ -24,15 +27,40 @@ type ProviderConfig struct {
 	Model   string
 }
 
+// TestResult holds the benchmark results for a provider
+type TestResult struct {
+	Provider         string        `json:"provider"`
+	Model            string        `json:"model"`
+	Timestamp        time.Time     `json:"timestamp"`
+	E2ELatency       time.Duration `json:"e2e_latency_ms"`
+	TTFT             time.Duration `json:"ttft_ms"`
+	Throughput       float64       `json:"throughput_tokens_per_sec"`
+	CompletionTokens int           `json:"completion_tokens"`
+	Success          bool          `json:"success"`
+	Error            string        `json:"error,omitempty"`
+}
+
 // testProviderMetrics runs a full benchmark test against a single provider.
 // It is designed to be run as a goroutine.
-func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync.WaitGroup) {
+func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync.WaitGroup, logDir, resultsDir string) {
 	// Defer wg.Done() if this is part of a concurrent group
 	if wg != nil {
 		defer wg.Done()
 	}
 
-	log.Printf("--- Testing: %s (%s) ---", config.Name, config.Model)
+	// Create log file for this provider
+	timestamp := time.Now().Format("20060102-150405")
+	logFile, err := os.Create(filepath.Join(logDir, fmt.Sprintf("%s-%s.log", config.Name, timestamp)))
+	if err != nil {
+		log.Printf("❌ Error creating log file for %s: %v", config.Name, err)
+		return
+	}
+	defer logFile.Close()
+
+	// Create a logger for this provider that writes to both stdout and file
+	providerLogger := log.New(io.MultiWriter(os.Stdout, logFile), "", log.LstdFlags)
+
+	providerLogger.Printf("--- Testing: %s (%s) ---", config.Name, config.Model)
 
 	// 5. Configure the OpenAI Client
 	clientConfig := openai.DefaultConfig(config.APIKey)
@@ -63,25 +91,46 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 	ctx := context.Background()
 	stream, err := client.CreateChatCompletionStream(ctx, req)
 	if err != nil {
-		log.Printf(" Error creating stream for %s: %v", config.Name, err)
+		providerLogger.Printf("❌ Error creating stream for %s: %v", config.Name, err)
+		// Save error result
+		saveResult(resultsDir, TestResult{
+			Provider:  config.Name,
+			Model:     config.Model,
+			Timestamp: time.Now(),
+			Success:   false,
+			Error:     err.Error(),
+		})
 		return
 	}
 	defer stream.Close() // IMPORTANT: Always close the stream
 
-	log.Printf("[%s] ... Request sent. Waiting for stream ...", config.Name)
+	providerLogger.Printf("[%s] ... Request sent. Waiting for stream ...", config.Name)
 
 	for {
 		response, err := stream.Recv()
 
 		// Check for end of stream
 		if errors.Is(err, io.EOF) {
-			log.Printf("[%s] ... Stream complete.", config.Name)
+			providerLogger.Printf("[%s] ... Stream complete.", config.Name)
 			break
 		}
 
 		if err != nil {
-			log.Printf("Stream error for %s: %v", config.Name, err)
+			providerLogger.Printf("Stream error for %s: %v", config.Name, err)
+			// Save error result
+			saveResult(resultsDir, TestResult{
+				Provider:  config.Name,
+				Model:     config.Model,
+				Timestamp: time.Now(),
+				Success:   false,
+				Error:     err.Error(),
+			})
 			return
+		}
+
+		// Check if Choices array is empty (some APIs send empty chunks)
+		if len(response.Choices) == 0 {
+			continue
 		}
 
 		// Get the content from the first choice
@@ -90,7 +139,7 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 		// Check if this is the first chunk with actual text
 		if content != "" && firstTokenTime.IsZero() {
 			firstTokenTime = time.Now() // ---- TTFT METRIC
-			log.Printf("[%s] ... First token received!", config.Name)
+			providerLogger.Printf("[%s] ... First token received!", config.Name)
 		}
 
 		// Append the content to our builder
@@ -104,7 +153,15 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 	// --- 8. Calculate and Print Results ---
 
 	if firstTokenTime.IsZero() {
-		log.Printf("Error for %s: Did not receive any content from the API.", config.Name)
+		providerLogger.Printf("Error for %s: Did not receive any content from the API.", config.Name)
+		// Save error result
+		saveResult(resultsDir, TestResult{
+			Provider:  config.Name,
+			Model:     config.Model,
+			Timestamp: time.Now(),
+			Success:   false,
+			Error:     "No content received from API",
+		})
 		return
 	}
 
@@ -114,7 +171,15 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 	completionTokens := len(tokenList)
 
 	if completionTokens == 0 {
-		log.Printf("Error for %s: Received response with 0 tokens.", config.Name)
+		providerLogger.Printf("Error for %s: Received response with 0 tokens.", config.Name)
+		// Save error result
+		saveResult(resultsDir, TestResult{
+			Provider:  config.Name,
+			Model:     config.Model,
+			Timestamp: time.Now(),
+			Success:   false,
+			Error:     "Received 0 tokens",
+		})
 		return
 	}
 
@@ -136,18 +201,49 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 		throughput = (float64(completionTokens) - 1.0) / generationTime.Seconds()
 	}
 
-	// --- Print Results (use log for thread-safety) ---
-	log.Println("==============================================")
-	log.Printf("   LLM Metrics for: %s", config.Name)
-	log.Printf("   Model: %s", config.Model)
-	log.Printf("   Total Output Tokens: %d", completionTokens)
-	log.Println("----------------------------------------------")
-	log.Printf("   ⚡ End-to-End Latency: %v", e2eLatency)
-	log.Printf("   ⚡ Latency (TTFT):     %v", ttft)
-	log.Printf("   ⚡ Throughput (Tokens/sec): %.2f tokens/s", throughput)
-	log.Println("==============================================")
+	// --- Print Results (use providerLogger for thread-safety) ---
+	providerLogger.Println("==============================================")
+	providerLogger.Printf("   LLM Metrics for: %s", config.Name)
+	providerLogger.Printf("   Model: %s", config.Model)
+	providerLogger.Printf("   Total Output Tokens: %d", completionTokens)
+	providerLogger.Println("----------------------------------------------")
+	providerLogger.Printf("   ⚡ End-to-End Latency: %v", e2eLatency)
+	providerLogger.Printf("   ⚡ Latency (TTFT):     %v", ttft)
+	providerLogger.Printf("   ⚡ Throughput (Tokens/sec): %.2f tokens/s", throughput)
+	providerLogger.Println("==============================================")
 	// Uncomment to see the full response
-	// log.Printf("[%s] Full Response:\n%s\n", config.Name, fullResponse)
+	// providerLogger.Printf("[%s] Full Response:\n%s\n", config.Name, fullResponse)
+
+	// Save successful result
+	saveResult(resultsDir, TestResult{
+		Provider:         config.Name,
+		Model:            config.Model,
+		Timestamp:        time.Now(),
+		E2ELatency:       e2eLatency,
+		TTFT:             ttft,
+		Throughput:       throughput,
+		CompletionTokens: completionTokens,
+		Success:          true,
+	})
+}
+
+// saveResult saves the test result to a JSON file
+func saveResult(resultsDir string, result TestResult) {
+	timestamp := result.Timestamp.Format("20060102-150405")
+	filename := filepath.Join(resultsDir, fmt.Sprintf("%s-%s.json", result.Provider, timestamp))
+
+	data, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		log.Printf("❌ Error marshaling result for %s: %v", result.Provider, err)
+		return
+	}
+
+	if err := os.WriteFile(filename, data, 0644); err != nil {
+		log.Printf("❌ Error writing result file for %s: %v", result.Provider, err)
+		return
+	}
+
+	log.Printf("✅ Result saved: %s", filename)
 }
 
 func main() {
@@ -173,13 +269,28 @@ func main() {
 	flagGenericModel := flag.String("model", "", "Model name for 'generic' provider (required if --provider is not set)")
 	flag.Parse()
 
-	// 3. Initialize Tokenizer
+	// 3. Create log and results directories
+	logDir := "logs"
+	resultsDir := "results"
+
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		log.Fatalf("Error creating logs directory: %v", err)
+	}
+
+	if err := os.MkdirAll(resultsDir, 0755); err != nil {
+		log.Fatalf("Error creating results directory: %v", err)
+	}
+
+	log.Printf("📁 Logs will be saved to: %s/", logDir)
+	log.Printf("📁 Results will be saved to: %s/", resultsDir)
+
+	// 4. Initialize Tokenizer
 	tke, err := tiktoken.GetEncoding("cl100k_base")
 	if err != nil {
 		log.Fatalf("Error getting tokenizer: %v\n(You might need to run: go get github.com/pkoukk/tiktoken-go)", err)
 	}
 
-	// 4. Build Full Provider Config Map from .env and flags
+	// 5. Build Full Provider Config Map from .env and flags
 	allProviderConfigs := make(map[string]ProviderConfig)
 
 	// Generic Provider (uses --url and --model flags)
@@ -288,10 +399,10 @@ func main() {
 		if *testAll {
 			// Run all tests concurrently
 			wg.Add(1)
-			go testProviderMetrics(provider, tke, &wg)
+			go testProviderMetrics(provider, tke, &wg, logDir, resultsDir)
 		} else {
 			// Run a single test sequentially
-			testProviderMetrics(provider, tke, nil)
+			testProviderMetrics(provider, tke, nil, logDir, resultsDir)
 		}
 	}
 
