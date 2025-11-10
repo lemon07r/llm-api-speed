@@ -11,12 +11,39 @@ A fast, concurrent benchmarking tool for measuring LLM API performance metrics a
 
 ## Quick Start
 
-```bash
-# Download dependencies
-go mod download
+### Option 1: Using Pre-built Binaries (Recommended)
 
-# Build
-go build -o llm-api-speed main.go
+```bash
+# Download the latest release for your platform from:
+# https://github.com/lemon07r/llm-api-speed/releases
+
+# Linux/macOS: Make executable
+chmod +x llm-api-speed-linux-amd64
+
+# Download example.env from the release
+# Or create .env file with your API keys
+cat > .env << 'EOF'
+OAI_API_KEY=your_key_here
+NIM_API_KEY=your_key_here
+NIM_MODEL=minimaxai/minimax-m2
+EOF
+
+# Run
+./llm-api-speed-linux-amd64 --provider nim
+```
+
+### Option 2: Build from Source
+
+```bash
+# Clone the repository
+git clone https://github.com/lemon07r/llm-api-speed.git
+cd llm-api-speed
+
+# Build (downloads deps, formats, vets, tests, and builds)
+make
+
+# Or just build without checks
+make build
 
 # Setup environment
 cp example.env .env
@@ -74,14 +101,26 @@ NOVITA_MODEL=minimaxai/minimax-m2
 ## Development
 
 ```bash
+# Run all checks and build
+make
+
 # Run tests
-go test -v
+make test
 
 # Format code
-go fmt ./...
+make fmt
 
 # Static analysis
-go vet ./...
+make vet
+
+# Clean build artifacts
+make clean
+
+# Build for all platforms (outputs to build/ directory)
+make release-build
+
+# Show all available targets
+make help
 ```
 
 ## License

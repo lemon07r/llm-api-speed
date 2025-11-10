@@ -2,6 +2,7 @@
 llm-api-speed
 llm-api-speed-*
 *.exe
+build/
 
 # Environment
 .env

@@ -18,20 +18,18 @@ jobs:
       with:
         go-version: '1.21'
 
-    - name: Download dependencies
-      run: go mod download
-
-    - name: Run tests
-      run: go test -v ./...
+    - name: Run tests and checks
+      run: make test
 
     - name: Run go vet
-      run: go vet ./...
+      run: make vet
 
-    - name: Run go fmt
+    - name: Check formatting
       run: |
-        if [ -n "$(gofmt -s -l .)" ]; then
-          echo "Go code is not formatted:"
-          gofmt -s -d .
+        make fmt
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "Code is not formatted. Please run 'make fmt'"
+          git diff
           exit 1
         fi
 
@@ -47,8 +45,5 @@ jobs:
       with:
         go-version: '1.21'
 
-    - name: Download dependencies
-      run: go mod download
-
     - name: Build
-      run: go build -v -o llm-api-speed main.go
+      run: make build
