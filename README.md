@@ -1,13 +1,15 @@
-# llm-api-speed
+# LLM API Speed
 
-A fast, concurrent benchmarking tool for measuring LLM API performance metrics across multiple providers.
+A fast, concurrent benchmarking tool for measuring LLM API performance metrics across multiple providers written in Go.
 
 ## Features
 
+- **Simple Single Binary CLI Tool**: No dependencies, installation, or scripts required - just download and run
 - **Multiple Provider Support**: Test OpenAI, NVIDIA NIM, NovitaAI, NebiusAI, MiniMax, and any OpenAI-compatible API
 - **Concurrent Testing**: Benchmark all providers simultaneously with `--all` flag
 - **Real Metrics**: Measures End-to-End Latency, Time to First Token (TTFT), and Throughput
 - **Accurate Token Counting**: Uses tiktoken for precise token measurements
+- **Multi-Run Averaging**: Runs 3 concurrent iterations per provider and averages results for more reliable metrics
 - **Session-Based Organization**: Each test run creates its own timestamped folder with logs and results
 - **Markdown Reports**: Auto-generates performance summaries with leaderboards and failure analysis
 - **Timeout Protection**: 2-minute timeout prevents indefinite hangs on stuck providers
