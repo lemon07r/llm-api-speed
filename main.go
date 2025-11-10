@@ -40,8 +40,115 @@ type TestResult struct {
 	Error            string        `json:"error,omitempty"`
 }
 
+// formatDuration formats a duration as decimal seconds
+func formatDuration(d time.Duration) string {
+	return fmt.Sprintf("%.3fs", d.Seconds())
+}
+
+// singleTestRun performs one test run and returns metrics or error
+func singleTestRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger *log.Logger, ctx context.Context) (e2e, ttft time.Duration, throughput float64, tokens int, err error) {
+	// Configure the OpenAI Client
+	clientConfig := openai.DefaultConfig(config.APIKey)
+	clientConfig.BaseURL = config.BaseURL
+	client := openai.NewClientWithConfig(clientConfig)
+
+	// Define the request
+	prompt := "You are a helpful assistant. Please write a short, 150-word story about a curious robot exploring an ancient, overgrown library on a forgotten planet."
+	messages := []openai.ChatCompletionMessage{
+		{
+			Role:    openai.ChatMessageRoleUser,
+			Content: prompt,
+		},
+	}
+
+	req := openai.ChatCompletionRequest{
+		Model:     config.Model,
+		Messages:  messages,
+		MaxTokens: 512,
+		Stream:    true,
+	}
+
+	// Execute the stream and measure metrics
+	startTime := time.Now()
+	var firstTokenTime time.Time
+	var fullResponseContent strings.Builder
+
+	stream, streamErr := client.CreateChatCompletionStream(ctx, req)
+	if streamErr != nil {
+		return 0, 0, 0, 0, fmt.Errorf("error creating stream: %w", streamErr)
+	}
+	defer stream.Close()
+
+	providerLogger.Printf("[%s] ... Request sent. Waiting for stream ...", config.Name)
+
+	for {
+		response, recvErr := stream.Recv()
+
+		// Check for end of stream
+		if errors.Is(recvErr, io.EOF) {
+			providerLogger.Printf("[%s] ... Stream complete.", config.Name)
+			break
+		}
+
+		if recvErr != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				return 0, 0, 0, 0, fmt.Errorf("timeout exceeded")
+			}
+			return 0, 0, 0, 0, fmt.Errorf("stream error: %w", recvErr)
+		}
+
+		// Check if Choices array is empty
+		if len(response.Choices) == 0 {
+			continue
+		}
+
+		// Get the content from the first choice
+		content := response.Choices[0].Delta.Content
+
+		// Check if this is the first chunk with actual text
+		if content != "" && firstTokenTime.IsZero() {
+			firstTokenTime = time.Now()
+			providerLogger.Printf("[%s] ... First token received!", config.Name)
+		}
+
+		// Append the content to our builder
+		if content != "" {
+			fullResponseContent.WriteString(content)
+		}
+	}
+
+	endTime := time.Now()
+
+	if firstTokenTime.IsZero() {
+		return 0, 0, 0, 0, fmt.Errorf("no content received from API")
+	}
+
+	// Get accurate token count
+	fullResponse := fullResponseContent.String()
+	tokenList := tke.Encode(fullResponse, nil, nil)
+	completionTokens := len(tokenList)
+
+	if completionTokens == 0 {
+		return 0, 0, 0, 0, fmt.Errorf("received 0 tokens")
+	}
+
+	// Calculate metrics
+	e2eLatency := endTime.Sub(startTime)
+	ttftLatency := firstTokenTime.Sub(startTime)
+	generationTime := e2eLatency - ttftLatency
+
+	var throughputVal float64
+	if generationTime.Seconds() <= 0 {
+		throughputVal = 0.0
+	} else {
+		throughputVal = (float64(completionTokens) - 1.0) / generationTime.Seconds()
+	}
+
+	return e2eLatency, ttftLatency, throughputVal, completionTokens, nil
+}
+
 // testProviderMetrics runs a full benchmark test against a single provider.
-// It is designed to be run as a goroutine.
+// It runs 3 iterations and reports averaged results, with a 2-minute total timeout.
 func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync.WaitGroup, logDir, resultsDir string, results *[]TestResult, resultsMutex *sync.Mutex) {
 	// Defer wg.Done() if this is part of a concurrent group
 	if wg != nil {
@@ -60,185 +167,87 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 	// Create a logger for this provider that writes to both stdout and file
 	providerLogger := log.New(io.MultiWriter(os.Stdout, logFile), "", log.LstdFlags)
 
-	providerLogger.Printf("--- Testing: %s (%s) ---", config.Name, config.Model)
+	providerLogger.Printf("--- Testing: %s (%s) - Running 3 iterations ---", config.Name, config.Model)
 
-	// 5. Configure the OpenAI Client
-	clientConfig := openai.DefaultConfig(config.APIKey)
-	clientConfig.BaseURL = config.BaseURL
-	client := openai.NewClientWithConfig(clientConfig)
-
-	// 6. Define the request
-	prompt := "You are a helpful assistant. Please write a short, 150-word story about a curious robot exploring an ancient, overgrown library on a forgotten planet."
-	messages := []openai.ChatCompletionMessage{
-		{
-			Role:    openai.ChatMessageRoleUser,
-			Content: prompt,
-		},
-	}
-
-	req := openai.ChatCompletionRequest{
-		Model:     config.Model,
-		Messages:  messages,
-		MaxTokens: 512,
-		Stream:    true,
-	}
-
-	// 7. Execute the stream and measure metrics
-	startTime := time.Now() // ---- START TIMER
-	var firstTokenTime time.Time
-	var fullResponseContent strings.Builder
-
-	// Add timeout context to prevent indefinite hangs (2 minutes)
+	// Create 2-minute timeout context for all runs
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	stream, err := client.CreateChatCompletionStream(ctx, req)
-	if err != nil {
-		providerLogger.Printf("Error creating stream for %s: %v", config.Name, err)
-		// Save error result
-		result := TestResult{
-			Provider:  config.Name,
-			Model:     config.Model,
-			Timestamp: time.Now(),
-			Success:   false,
-			Error:     err.Error(),
-		}
-		saveResult(resultsDir, result)
-		appendResult(results, resultsMutex, result)
-		return
-	}
-	defer stream.Close() // IMPORTANT: Always close the stream
+	// Run up to 3 iterations and collect metrics
+	const maxIterations = 3
+	var e2eSum, ttftSum time.Duration
+	var throughputSum float64
+	var tokensSum int
+	successfulRuns := 0
 
-	providerLogger.Printf("[%s] ... Request sent. Waiting for stream ...", config.Name)
-
-	for {
-		response, err := stream.Recv()
-
-		// Check for end of stream
-		if errors.Is(err, io.EOF) {
-			providerLogger.Printf("[%s] ... Stream complete.", config.Name)
+	for i := 1; i <= maxIterations; i++ {
+		// Check if timeout exceeded before starting next run
+		if ctx.Err() != nil {
+			providerLogger.Printf("[%s] Timeout reached after %d run(s)", config.Name, successfulRuns)
 			break
 		}
 
-		if err != nil {
-			errMsg := err.Error()
-			if ctx.Err() == context.DeadlineExceeded {
-				errMsg = "Timeout: stream took longer than 5 minutes"
+		providerLogger.Printf("[%s] Run %d/%d", config.Name, i, maxIterations)
+
+		e2e, ttft, throughput, tokens, runErr := singleTestRun(config, tke, providerLogger, ctx)
+		if runErr != nil {
+			providerLogger.Printf("[%s] Run %d failed: %v", config.Name, i, runErr)
+			// If no successful runs yet, save error result
+			if successfulRuns == 0 && i == maxIterations {
+				result := TestResult{
+					Provider:  config.Name,
+					Model:     config.Model,
+					Timestamp: time.Now(),
+					Success:   false,
+					Error:     runErr.Error(),
+				}
+				saveResult(resultsDir, result)
+				appendResult(results, resultsMutex, result)
 			}
-			providerLogger.Printf("Stream error for %s: %v", config.Name, errMsg)
-			// Save error result
-			result := TestResult{
-				Provider:  config.Name,
-				Model:     config.Model,
-				Timestamp: time.Now(),
-				Success:   false,
-				Error:     errMsg,
-			}
-			saveResult(resultsDir, result)
-			appendResult(results, resultsMutex, result)
-			return
+			break
 		}
 
-		// Check if Choices array is empty (some APIs send empty chunks)
-		if len(response.Choices) == 0 {
-			providerLogger.Printf("[%s] ... Received empty chunk (no Choices)", config.Name)
-			continue
-		}
+		e2eSum += e2e
+		ttftSum += ttft
+		throughputSum += throughput
+		tokensSum += tokens
+		successfulRuns++
 
-		// Get the content from the first choice
-		content := response.Choices[0].Delta.Content
-
-		// Check if this is the first chunk with actual text
-		if content != "" && firstTokenTime.IsZero() {
-			firstTokenTime = time.Now() // ---- TTFT METRIC
-			providerLogger.Printf("[%s] ... First token received!", config.Name)
-		}
-
-		// Append the content to our builder
-		if content != "" {
-			fullResponseContent.WriteString(content)
-		}
+		providerLogger.Printf("[%s] Run %d complete: E2E=%s TTFT=%s Throughput=%.2f tok/s",
+			config.Name, i, formatDuration(e2e), formatDuration(ttft), throughput)
 	}
 
-	endTime := time.Now() // ---- E2E METRIC
-
-	// --- 8. Calculate and Print Results ---
-
-	if firstTokenTime.IsZero() {
-		providerLogger.Printf("Error for %s: Did not receive any content from the API.", config.Name)
-		// Save error result
-		result := TestResult{
-			Provider:  config.Name,
-			Model:     config.Model,
-			Timestamp: time.Now(),
-			Success:   false,
-			Error:     "No content received from API",
-		}
-		saveResult(resultsDir, result)
-		appendResult(results, resultsMutex, result)
+	if successfulRuns == 0 {
+		providerLogger.Printf("[%s] All runs failed", config.Name)
 		return
 	}
 
-	// Get accurate token count
-	fullResponse := fullResponseContent.String()
-	tokenList := tke.Encode(fullResponse, nil, nil)
-	completionTokens := len(tokenList)
+	// Calculate averages
+	avgE2E := e2eSum / time.Duration(successfulRuns)
+	avgTTFT := ttftSum / time.Duration(successfulRuns)
+	avgThroughput := throughputSum / float64(successfulRuns)
+	avgTokens := tokensSum / successfulRuns
 
-	if completionTokens == 0 {
-		providerLogger.Printf("Error for %s: Received response with 0 tokens.", config.Name)
-		// Save error result
-		result := TestResult{
-			Provider:  config.Name,
-			Model:     config.Model,
-			Timestamp: time.Now(),
-			Success:   false,
-			Error:     "Received 0 tokens",
-		}
-		saveResult(resultsDir, result)
-		appendResult(results, resultsMutex, result)
-		return
-	}
-
-	// 1. End-to-End Latency
-	e2eLatency := endTime.Sub(startTime)
-
-	// 2. Time to First Token (TTFT)
-	ttft := firstTokenTime.Sub(startTime)
-
-	// 3. Throughput (Tokens per Second)
-	// This is (Total Tokens - 1) / (Time from first token to last token)
-	generationTime := e2eLatency - ttft
-	var throughput float64
-
-	if generationTime.Seconds() <= 0 {
-		// Handle edge case where generation is too fast or only 1 token
-		throughput = 0.0
-	} else {
-		throughput = (float64(completionTokens) - 1.0) / generationTime.Seconds()
-	}
-
-	// --- Print Results (use providerLogger for thread-safety) ---
+	// Print averaged results
 	providerLogger.Println("==============================================")
-	providerLogger.Printf("   LLM Metrics for: %s", config.Name)
+	providerLogger.Printf("   LLM Metrics for: %s (averaged over %d run(s))", config.Name, successfulRuns)
 	providerLogger.Printf("   Model: %s", config.Model)
-	providerLogger.Printf("   Total Output Tokens: %d", completionTokens)
+	providerLogger.Printf("   Avg Output Tokens: %d", avgTokens)
 	providerLogger.Println("----------------------------------------------")
-	providerLogger.Printf("   End-to-End Latency: %v", e2eLatency)
-	providerLogger.Printf("   Latency (TTFT):     %v", ttft)
-	providerLogger.Printf("   Throughput (Tokens/sec): %.2f tokens/s", throughput)
+	providerLogger.Printf("   End-to-End Latency: %s", formatDuration(avgE2E))
+	providerLogger.Printf("   Latency (TTFT):     %s", formatDuration(avgTTFT))
+	providerLogger.Printf("   Throughput (Tokens/sec): %.2f tokens/s", avgThroughput)
 	providerLogger.Println("==============================================")
-	// Uncomment to see the full response
-	// providerLogger.Printf("[%s] Full Response:\n%s\n", config.Name, fullResponse)
 
 	// Save successful result
 	result := TestResult{
 		Provider:         config.Name,
 		Model:            config.Model,
 		Timestamp:        time.Now(),
-		E2ELatency:       e2eLatency,
-		TTFT:             ttft,
-		Throughput:       throughput,
-		CompletionTokens: completionTokens,
+		E2ELatency:       avgE2E,
+		TTFT:             avgTTFT,
+		Throughput:       avgThroughput,
+		CompletionTokens: avgTokens,
 		Success:          true,
 	}
 	saveResult(resultsDir, result)
@@ -306,11 +315,11 @@ func generateMarkdownReport(resultsDir string, results []TestResult, sessionTime
 
 		for _, r := range results {
 			if r.Success {
-				report.WriteString(fmt.Sprintf("| %s | %s | %v | %v | %.2f tok/s | %d |\n",
+				report.WriteString(fmt.Sprintf("| %s | %s | %s | %s | %.2f tok/s | %d |\n",
 					r.Provider,
 					r.Model,
-					r.E2ELatency,
-					r.TTFT,
+					formatDuration(r.E2ELatency),
+					formatDuration(r.TTFT),
 					r.Throughput,
 					r.CompletionTokens))
 			}
@@ -361,12 +370,12 @@ func generateMarkdownReport(resultsDir string, results []TestResult, sessionTime
 		report.WriteString("|------|----------|------------|------|-------------|\n")
 
 		for i, r := range successfulResults {
-			report.WriteString(fmt.Sprintf("| %d | %s | %.2f tok/s | %v | %v |\n",
+			report.WriteString(fmt.Sprintf("| %d | %s | %.2f tok/s | %s | %s |\n",
 				i+1,
 				r.Provider,
 				r.Throughput,
-				r.TTFT,
-				r.E2ELatency))
+				formatDuration(r.TTFT),
+				formatDuration(r.E2ELatency)))
 		}
 		report.WriteString("\n")
 
@@ -385,12 +394,12 @@ func generateMarkdownReport(resultsDir string, results []TestResult, sessionTime
 		report.WriteString("|------|----------|------|------------|-------------|\n")
 
 		for i, r := range successfulResults {
-			report.WriteString(fmt.Sprintf("| %d | %s | %v | %.2f tok/s | %v |\n",
+			report.WriteString(fmt.Sprintf("| %d | %s | %s | %.2f tok/s | %s |\n",
 				i+1,
 				r.Provider,
-				r.TTFT,
+				formatDuration(r.TTFT),
 				r.Throughput,
-				r.E2ELatency))
+				formatDuration(r.E2ELatency)))
 		}
 		report.WriteString("\n")
 
@@ -409,11 +418,11 @@ func generateMarkdownReport(resultsDir string, results []TestResult, sessionTime
 		report.WriteString("|------|----------|-------------|------|------------|\n")
 
 		for i, r := range successfulResults {
-			report.WriteString(fmt.Sprintf("| %d | %s | %v | %v | %.2f tok/s |\n",
+			report.WriteString(fmt.Sprintf("| %d | %s | %s | %s | %.2f tok/s |\n",
 				i+1,
 				r.Provider,
-				r.E2ELatency,
-				r.TTFT,
+				formatDuration(r.E2ELatency),
+				formatDuration(r.TTFT),
 				r.Throughput))
 		}
 		report.WriteString("\n")
