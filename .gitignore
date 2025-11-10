@@ -1,4 +1,12 @@
-*.md
-!README.md
+# Binaries
+llm-api-speed
+llm-api-speed-*
+*.exe
+
+# Environment
 .env
 !example.env
+
+# Markdown (except README)
+*.md
+!README.md

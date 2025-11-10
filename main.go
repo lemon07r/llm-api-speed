@@ -26,7 +26,7 @@ type ProviderConfig struct {
 
 // testProviderMetrics runs a full benchmark test against a single provider.
 // It is designed to be run as a goroutine.
-func testProviderMetrics(config ProviderConfig, tke *tiktoken.Encoding, wg *sync.WaitGroup) {
+func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync.WaitGroup) {
 	// Defer wg.Done() if this is part of a concurrent group
 	if wg != nil {
 		defer wg.Done()
