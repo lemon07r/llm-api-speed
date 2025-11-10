@@ -8,6 +8,9 @@ A fast, concurrent benchmarking tool for measuring LLM API performance metrics a
 - **Concurrent Testing**: Benchmark all providers simultaneously with `--all` flag
 - **Real Metrics**: Measures End-to-End Latency, Time to First Token (TTFT), and Throughput
 - **Accurate Token Counting**: Uses tiktoken for precise token measurements
+- **Session-Based Organization**: Each test run creates its own timestamped folder with logs and results
+- **Markdown Reports**: Auto-generates performance summaries with leaderboards and failure analysis
+- **Timeout Protection**: 2-minute timeout prevents indefinite hangs on stuck providers
 
 ## Quick Start
 
@@ -72,6 +75,28 @@ cp example.env .env
 # Test all configured providers concurrently
 ./llm-api-speed --all
 ```
+
+## Output
+
+Each test run creates a session folder: `results/session-YYYYMMDD-HHMMSS/`
+
+```
+results/session-20251110-004615/
+├── logs/
+│   ├── nim-20251110-004615.log
+│   ├── novita-20251110-004615.log
+│   └── minimax-20251110-004615.log
+├── nim-20251110-004637.json
+├── novita-20251110-004640.json
+├── minimax-20251110-004642.json
+└── REPORT.md  # Performance summary with leaderboards
+```
+
+**REPORT.md** includes:
+- Summary statistics (success/failure counts)
+- Performance leaderboards (by throughput and TTFT)
+- Detailed metrics for all providers
+- Error details for failed tests
 
 ## Supported Providers
 

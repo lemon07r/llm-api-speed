@@ -88,8 +88,8 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 	var firstTokenTime time.Time
 	var fullResponseContent strings.Builder
 
-	// Add timeout context to prevent indefinite hangs (5 minutes)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// Add timeout context to prevent indefinite hangs (2 minutes)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
 	stream, err := client.CreateChatCompletionStream(ctx, req)
