@@ -702,10 +702,10 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 			// Make first request immediately
 			for {
 				reqNum++
-				
+
 				// Create 30-second timeout context for this request
 				reqCtx, reqCancel := context.WithTimeout(sessionCtx, 30*time.Second)
-				
+
 				providerLogger.Printf("[Worker %d] Request #%d starting", id, reqNum)
 
 				var e2e, ttft time.Duration
@@ -822,13 +822,13 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 	// Save diagnostic summary
 	summaryFile := filepath.Join(resultsDir, fmt.Sprintf("%s-diagnostic-summary-%s.json", config.Name, timestamp))
 	summary := map[string]interface{}{
-		"provider":         config.Name,
-		"model":            config.Model,
-		"mode":             string(mode),
-		"total_requests":   successCount + failureCount,
-		"successful":       successCount,
-		"failed":           failureCount,
-		"timestamp":        time.Now(),
+		"provider":       config.Name,
+		"model":          config.Model,
+		"mode":           string(mode),
+		"total_requests": successCount + failureCount,
+		"successful":     successCount,
+		"failed":         failureCount,
+		"timestamp":      time.Now(),
 	}
 
 	if successCount > 0 {
