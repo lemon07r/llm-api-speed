@@ -167,58 +167,90 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 	// Create a logger for this provider that writes to both stdout and file
 	providerLogger := log.New(io.MultiWriter(os.Stdout, logFile), "", log.LstdFlags)
 
-	providerLogger.Printf("--- Testing: %s (%s) - Running 3 iterations ---", config.Name, config.Model)
+	providerLogger.Printf("--- Testing: %s (%s) - Running 3 concurrent iterations ---", config.Name, config.Model)
 
 	// Create 2-minute timeout context for all runs
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	// Run up to 3 iterations and collect metrics
+	// Run 3 iterations concurrently
 	const maxIterations = 3
+	type runResult struct {
+		e2e        time.Duration
+		ttft       time.Duration
+		throughput float64
+		tokens     int
+		err        error
+		runNum     int
+	}
+
+	resultsChan := make(chan runResult, maxIterations)
+	var runWg sync.WaitGroup
+
+	// Launch concurrent workers
+	for i := 1; i <= maxIterations; i++ {
+		runWg.Add(1)
+		go func(runNum int) {
+			defer runWg.Done()
+			providerLogger.Printf("[%s] Run %d/%d starting", config.Name, runNum, maxIterations)
+
+			e2e, ttft, throughput, tokens, runErr := singleTestRun(config, tke, providerLogger, ctx)
+
+			if runErr != nil {
+				providerLogger.Printf("[%s] Run %d failed: %v", config.Name, runNum, runErr)
+			} else {
+				providerLogger.Printf("[%s] Run %d complete: E2E=%s TTFT=%s Throughput=%.2f tok/s",
+					config.Name, runNum, formatDuration(e2e), formatDuration(ttft), throughput)
+			}
+
+			resultsChan <- runResult{
+				e2e:        e2e,
+				ttft:       ttft,
+				throughput: throughput,
+				tokens:     tokens,
+				err:        runErr,
+				runNum:     runNum,
+			}
+		}(i)
+	}
+
+	// Close channel after all workers complete
+	go func() {
+		runWg.Wait()
+		close(resultsChan)
+	}()
+
+	// Collect results from all workers
 	var e2eSum, ttftSum time.Duration
 	var throughputSum float64
 	var tokensSum int
 	successfulRuns := 0
+	var firstError error
 
-	for i := 1; i <= maxIterations; i++ {
-		// Check if timeout exceeded before starting next run
-		if ctx.Err() != nil {
-			providerLogger.Printf("[%s] Timeout reached after %d run(s)", config.Name, successfulRuns)
-			break
+	for result := range resultsChan {
+		if result.err == nil {
+			e2eSum += result.e2e
+			ttftSum += result.ttft
+			throughputSum += result.throughput
+			tokensSum += result.tokens
+			successfulRuns++
+		} else if firstError == nil {
+			firstError = result.err
 		}
-
-		providerLogger.Printf("[%s] Run %d/%d", config.Name, i, maxIterations)
-
-		e2e, ttft, throughput, tokens, runErr := singleTestRun(config, tke, providerLogger, ctx)
-		if runErr != nil {
-			providerLogger.Printf("[%s] Run %d failed: %v", config.Name, i, runErr)
-			// If no successful runs yet, save error result
-			if successfulRuns == 0 && i == maxIterations {
-				result := TestResult{
-					Provider:  config.Name,
-					Model:     config.Model,
-					Timestamp: time.Now(),
-					Success:   false,
-					Error:     runErr.Error(),
-				}
-				saveResult(resultsDir, result)
-				appendResult(results, resultsMutex, result)
-			}
-			break
-		}
-
-		e2eSum += e2e
-		ttftSum += ttft
-		throughputSum += throughput
-		tokensSum += tokens
-		successfulRuns++
-
-		providerLogger.Printf("[%s] Run %d complete: E2E=%s TTFT=%s Throughput=%.2f tok/s",
-			config.Name, i, formatDuration(e2e), formatDuration(ttft), throughput)
 	}
 
 	if successfulRuns == 0 {
 		providerLogger.Printf("[%s] All runs failed", config.Name)
+		// Save error result
+		result := TestResult{
+			Provider:  config.Name,
+			Model:     config.Model,
+			Timestamp: time.Now(),
+			Success:   false,
+			Error:     firstError.Error(),
+		}
+		saveResult(resultsDir, result)
+		appendResult(results, resultsMutex, result)
 		return
 	}
 
