@@ -37,6 +37,7 @@ type TestResult struct {
 	TTFT             time.Duration `json:"ttftMs"`
 	Throughput       float64       `json:"throughputTokensPerSec"`
 	CompletionTokens int           `json:"completionTokens"`
+	ProjectedE2E     time.Duration `json:"projectedE2eLatency,omitempty"`
 	Success          bool          `json:"success"`
 	Error            string        `json:"error,omitempty"`
 	Mode             string        `json:"mode"`
@@ -62,6 +63,193 @@ func formatDuration(d time.Duration) string {
 }
 
 var saveResponses bool
+var targetTokens int
+
+// calculateProjectedE2E calculates the projected E2E latency for a normalized token count.
+// Formula: ProjectedE2E = TTFT + (TargetTokens / Throughput).
+func calculateProjectedE2E(ttft time.Duration, throughput float64, target int) time.Duration {
+	if throughput <= 0 || target <= 0 {
+		return 0
+	}
+	generationTime := float64(target) / throughput
+	return ttft + time.Duration(generationTime*float64(time.Second))
+}
+
+// writeTestResultRow writes a single test result row to the report.
+func writeTestResultRow(report *strings.Builder, r TestResult, includeProjected bool) {
+	if includeProjected && r.ProjectedE2E > 0 {
+		fmt.Fprintf(report, "| %s | %s | %s | %s | %s | %.2f tok/s | %d | %s |\n",
+			r.Provider, r.Model, r.Mode,
+			formatDuration(r.E2ELatency), formatDuration(r.TTFT),
+			r.Throughput, r.CompletionTokens, formatDuration(r.ProjectedE2E))
+	} else {
+		fmt.Fprintf(report, "| %s | %s | %s | %s | %s | %.2f tok/s | %d |\n",
+			r.Provider, r.Model, r.Mode,
+			formatDuration(r.E2ELatency), formatDuration(r.TTFT),
+			r.Throughput, r.CompletionTokens)
+	}
+}
+
+// writeDiagnosticResultRow writes a single diagnostic result row to the report.
+func writeDiagnosticResultRow(report *strings.Builder, r DiagnosticSummary, includeProjected bool) {
+	successRate := fmt.Sprintf("%d/%d", r.Successful, r.TotalRequests)
+	failRate := fmt.Sprintf("%d", r.Failed)
+	avgE2E := NotAvailable
+	avgTTFT := NotAvailable
+	avgThroughput := NotAvailable
+	projectedE2E := NotAvailable
+
+	if r.Successful > 0 {
+		avgE2E = formatDuration(r.AvgE2ELatency)
+		avgTTFT = formatDuration(r.AvgTTFT)
+		avgThroughput = fmt.Sprintf("%.2f tok/s", r.AvgThroughput)
+		if r.ProjectedE2E > 0 {
+			projectedE2E = formatDuration(r.ProjectedE2E)
+		}
+	}
+
+	if includeProjected {
+		fmt.Fprintf(report, "| %s | %s | %s | %d | %s | %s | %s | %s | %s | %s |\n",
+			r.Provider, r.Model, r.Mode, r.TotalRequests,
+			successRate, failRate, avgE2E, avgTTFT, avgThroughput, projectedE2E)
+	} else {
+		fmt.Fprintf(report, "| %s | %s | %s | %d | %s | %s | %s | %s | %s |\n",
+			r.Provider, r.Model, r.Mode, r.TotalRequests,
+			successRate, failRate, avgE2E, avgTTFT, avgThroughput)
+	}
+}
+
+// writeProjectedE2ELeaderboard writes the projected E2E leaderboard section for TestResult.
+func writeProjectedE2ELeaderboard(report *strings.Builder, results []TestResult) {
+	// Sort by Projected E2E
+	for i := 0; i < len(results); i++ {
+		for j := i + 1; j < len(results); j++ {
+			if results[j].ProjectedE2E > 0 && results[i].ProjectedE2E > 0 &&
+				results[j].ProjectedE2E < results[i].ProjectedE2E {
+				results[i], results[j] = results[j], results[i]
+			}
+		}
+	}
+
+	report.WriteString("| Rank | Provider | Projected E2E | TTFT | Throughput |\n")
+	report.WriteString("|------|----------|---------------|------|------------|\n")
+
+	for i, r := range results {
+		if r.ProjectedE2E > 0 {
+			fmt.Fprintf(report, "| %d | %s | %s | %s | %.2f tok/s |\n",
+				i+1, r.Provider, formatDuration(r.ProjectedE2E),
+				formatDuration(r.TTFT), r.Throughput)
+		}
+	}
+	report.WriteString("\n")
+}
+
+// writeProjectedE2EDiagnosticLeaderboard writes the projected E2E leaderboard section for DiagnosticSummary.
+func writeProjectedE2EDiagnosticLeaderboard(report *strings.Builder, results []DiagnosticSummary) {
+	// Sort by Projected E2E
+	for i := 0; i < len(results); i++ {
+		for j := i + 1; j < len(results); j++ {
+			if results[j].ProjectedE2E > 0 && results[i].ProjectedE2E > 0 &&
+				results[j].ProjectedE2E < results[i].ProjectedE2E {
+				results[i], results[j] = results[j], results[i]
+			}
+		}
+	}
+
+	report.WriteString("| Rank | Provider | Projected E2E | TTFT | Throughput | Success Rate |\n")
+	report.WriteString("|------|----------|---------------|------|------------|-------------|\n")
+
+	for i, r := range results {
+		if r.ProjectedE2E > 0 {
+			successRate := fmt.Sprintf("%.1f%%", 100.0*float64(r.Successful)/float64(r.TotalRequests))
+			fmt.Fprintf(report, "| %d | %s | %s | %s | %.2f tok/s | %s |\n",
+				i+1, r.Provider, formatDuration(r.ProjectedE2E),
+				formatDuration(r.AvgTTFT), r.AvgThroughput, successRate)
+		}
+	}
+	report.WriteString("\n")
+}
+
+// writeTestResultLeaderboards writes all leaderboard sections for TestResult.
+func writeTestResultLeaderboards(report *strings.Builder, results []TestResult) {
+	report.WriteString("## Performance Leaderboard\n\n")
+	report.WriteString("### By Throughput (Tokens/sec)\n\n")
+
+	// Sort by throughput
+	successfulResults := make([]TestResult, 0)
+	for _, r := range results {
+		if r.Success {
+			successfulResults = append(successfulResults, r)
+		}
+	}
+
+	// Simple bubble sort by throughput descending
+	for i := 0; i < len(successfulResults); i++ {
+		for j := i + 1; j < len(successfulResults); j++ {
+			if successfulResults[j].Throughput > successfulResults[i].Throughput {
+				successfulResults[i], successfulResults[j] = successfulResults[j], successfulResults[i]
+			}
+		}
+	}
+
+	report.WriteString("| Rank | Provider | Throughput | TTFT | E2E Latency |\n")
+	report.WriteString("|------|----------|------------|------|-------------|\n")
+
+	for i, r := range successfulResults {
+		fmt.Fprintf(report, "| %d | %s | %.2f tok/s | %s | %s |\n",
+			i+1, r.Provider, r.Throughput,
+			formatDuration(r.TTFT), formatDuration(r.E2ELatency))
+	}
+	report.WriteString("\n")
+
+	// Sort by TTFT
+	report.WriteString("### By Time to First Token (TTFT)\n\n")
+
+	for i := 0; i < len(successfulResults); i++ {
+		for j := i + 1; j < len(successfulResults); j++ {
+			if successfulResults[j].TTFT < successfulResults[i].TTFT {
+				successfulResults[i], successfulResults[j] = successfulResults[j], successfulResults[i]
+			}
+		}
+	}
+
+	report.WriteString("| Rank | Provider | TTFT | Throughput | E2E Latency |\n")
+	report.WriteString("|------|----------|------|------------|-------------|\n")
+
+	for i, r := range successfulResults {
+		fmt.Fprintf(report, "| %d | %s | %s | %.2f tok/s | %s |\n",
+			i+1, r.Provider, formatDuration(r.TTFT),
+			r.Throughput, formatDuration(r.E2ELatency))
+	}
+	report.WriteString("\n")
+
+	// Sort by E2E Latency
+	report.WriteString("### By End-to-End Latency\n\n")
+
+	for i := 0; i < len(successfulResults); i++ {
+		for j := i + 1; j < len(successfulResults); j++ {
+			if successfulResults[j].E2ELatency < successfulResults[i].E2ELatency {
+				successfulResults[i], successfulResults[j] = successfulResults[j], successfulResults[i]
+			}
+		}
+	}
+
+	report.WriteString("| Rank | Provider | E2E Latency | TTFT | Throughput |\n")
+	report.WriteString("|------|----------|-------------|------|------------|\n")
+
+	for i, r := range successfulResults {
+		fmt.Fprintf(report, "| %d | %s | %s | %s | %.2f tok/s |\n",
+			i+1, r.Provider, formatDuration(r.E2ELatency),
+			formatDuration(r.TTFT), r.Throughput)
+	}
+	report.WriteString("\n")
+
+	// Sort by Projected E2E (if available)
+	if targetTokens > 0 {
+		fmt.Fprintf(report, "### By Projected E2E Latency (%d tokens)\n\n", targetTokens)
+		writeProjectedE2ELeaderboard(report, successfulResults)
+	}
+}
 
 // singleTestRun performs one test run and returns metrics or error.
 func singleTestRun(ctx context.Context, config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger *log.Logger) (e2e, ttft time.Duration, throughput float64, tokens int, response string, err error) {
@@ -549,6 +737,12 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 	providerLogger.Printf("   Throughput (Tokens/sec): %.2f tokens/s", avgThroughput)
 	providerLogger.Println("==============================================")
 
+	// Calculate projected E2E if target tokens is set
+	var projectedE2E time.Duration
+	if targetTokens > 0 {
+		projectedE2E = calculateProjectedE2E(avgTTFT, avgThroughput, targetTokens)
+	}
+
 	// Save successful result
 	result := TestResult{
 		Provider:         config.Name,
@@ -558,6 +752,7 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 		TTFT:             avgTTFT,
 		Throughput:       avgThroughput,
 		CompletionTokens: avgTokens,
+		ProjectedE2E:     projectedE2E,
 		Success:          true,
 		Mode:             modeStr,
 	}
@@ -621,19 +816,18 @@ func generateMarkdownReport(resultsDir string, results []TestResult, sessionTime
 	// Successful results table
 	if successful > 0 {
 		report.WriteString("## Successful Tests\n\n")
-		report.WriteString("| Provider | Model | Mode | E2E Latency | TTFT | Throughput | Tokens |\n")
-		report.WriteString("|----------|-------|------|-------------|------|------------|--------|\n")
+		if targetTokens > 0 {
+			report.WriteString(fmt.Sprintf("**Note:** Projected E2E calculated for %d tokens using formula: TTFT + (Target Tokens / Throughput)\n\n", targetTokens))
+			report.WriteString("| Provider | Model | Mode | E2E Latency | TTFT | Throughput | Tokens | Projected E2E |\n")
+			report.WriteString("|----------|-------|------|-------------|------|------------|--------|---------------|\n")
+		} else {
+			report.WriteString("| Provider | Model | Mode | E2E Latency | TTFT | Throughput | Tokens |\n")
+			report.WriteString("|----------|-------|------|-------------|------|------------|--------|\n")
+		}
 
 		for _, r := range results {
 			if r.Success {
-				report.WriteString(fmt.Sprintf("| %s | %s | %s | %s | %s | %.2f tok/s | %d |\n",
-					r.Provider,
-					r.Model,
-					r.Mode,
-					formatDuration(r.E2ELatency),
-					formatDuration(r.TTFT),
-					r.Throughput,
-					r.CompletionTokens))
+				writeTestResultRow(&report, r, targetTokens > 0)
 			}
 		}
 		report.WriteString("\n")
@@ -659,86 +853,7 @@ func generateMarkdownReport(resultsDir string, results []TestResult, sessionTime
 
 	// Leaderboard (sorted by throughput)
 	if successful > 0 {
-		report.WriteString("## Performance Leaderboard\n\n")
-		report.WriteString("### By Throughput (Tokens/sec)\n\n")
-
-		// Sort by throughput
-		successfulResults := make([]TestResult, 0)
-		for _, r := range results {
-			if r.Success {
-				successfulResults = append(successfulResults, r)
-			}
-		}
-
-		// Simple bubble sort by throughput descending
-		for i := 0; i < len(successfulResults); i++ {
-			for j := i + 1; j < len(successfulResults); j++ {
-				if successfulResults[j].Throughput > successfulResults[i].Throughput {
-					successfulResults[i], successfulResults[j] = successfulResults[j], successfulResults[i]
-				}
-			}
-		}
-
-		report.WriteString("| Rank | Provider | Throughput | TTFT | E2E Latency |\n")
-		report.WriteString("|------|----------|------------|------|-------------|\n")
-
-		for i, r := range successfulResults {
-			report.WriteString(fmt.Sprintf("| %d | %s | %.2f tok/s | %s | %s |\n",
-				i+1,
-				r.Provider,
-				r.Throughput,
-				formatDuration(r.TTFT),
-				formatDuration(r.E2ELatency)))
-		}
-		report.WriteString("\n")
-
-		// Sort by TTFT
-		report.WriteString("### By Time to First Token (TTFT)\n\n")
-
-		for i := 0; i < len(successfulResults); i++ {
-			for j := i + 1; j < len(successfulResults); j++ {
-				if successfulResults[j].TTFT < successfulResults[i].TTFT {
-					successfulResults[i], successfulResults[j] = successfulResults[j], successfulResults[i]
-				}
-			}
-		}
-
-		report.WriteString("| Rank | Provider | TTFT | Throughput | E2E Latency |\n")
-		report.WriteString("|------|----------|------|------------|-------------|\n")
-
-		for i, r := range successfulResults {
-			report.WriteString(fmt.Sprintf("| %d | %s | %s | %.2f tok/s | %s |\n",
-				i+1,
-				r.Provider,
-				formatDuration(r.TTFT),
-				r.Throughput,
-				formatDuration(r.E2ELatency)))
-		}
-		report.WriteString("\n")
-
-		// Sort by E2E Latency
-		report.WriteString("### By End-to-End Latency\n\n")
-
-		for i := 0; i < len(successfulResults); i++ {
-			for j := i + 1; j < len(successfulResults); j++ {
-				if successfulResults[j].E2ELatency < successfulResults[i].E2ELatency {
-					successfulResults[i], successfulResults[j] = successfulResults[j], successfulResults[i]
-				}
-			}
-		}
-
-		report.WriteString("| Rank | Provider | E2E Latency | TTFT | Throughput |\n")
-		report.WriteString("|------|----------|-------------|------|------------|\n")
-
-		for i, r := range successfulResults {
-			report.WriteString(fmt.Sprintf("| %d | %s | %s | %s | %.2f tok/s |\n",
-				i+1,
-				r.Provider,
-				formatDuration(r.E2ELatency),
-				formatDuration(r.TTFT),
-				r.Throughput))
-		}
-		report.WriteString("\n")
+		writeTestResultLeaderboards(&report, results)
 	}
 
 	report.WriteString("---\n\n")
@@ -765,6 +880,7 @@ type DiagnosticSummary struct {
 	AvgTTFT       time.Duration  `json:"avgTtft"`
 	AvgThroughput float64        `json:"avgThroughput"`
 	AvgTokens     int            `json:"avgTokens"`
+	ProjectedE2E  time.Duration  `json:"projectedE2eLatency,omitempty"`
 	Errors        map[string]int `json:"errors,omitempty"`
 }
 
@@ -974,6 +1090,12 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 		providerLogger.Printf("Average TTFT: %s", formatDuration(avgTTFT))
 		providerLogger.Printf("Average Throughput: %.2f tokens/s", avgThroughput)
 		providerLogger.Printf("Average Tokens: %d", avgTokens)
+
+		// Display projected E2E if target tokens is set
+		if targetTokens > 0 {
+			projectedE2E := calculateProjectedE2E(avgTTFT, avgThroughput, targetTokens)
+			providerLogger.Printf("Projected E2E (%d tokens): %s", targetTokens, formatDuration(projectedE2E))
+		}
 	}
 
 	if len(errors) > 0 {
@@ -1002,6 +1124,11 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 		summary.AvgTTFT = totalTTFT / time.Duration(successCount)
 		summary.AvgThroughput = totalThroughput / float64(successCount)
 		summary.AvgTokens = totalTokens / successCount
+
+		// Calculate projected E2E if target tokens is set
+		if targetTokens > 0 {
+			summary.ProjectedE2E = calculateProjectedE2E(summary.AvgTTFT, summary.AvgThroughput, targetTokens)
+		}
 	}
 
 	if len(errors) > 0 {
@@ -1062,34 +1189,21 @@ func generateDiagnosticReport(resultsDir string, results []DiagnosticSummary, se
 	// Detailed results table
 	if len(results) > 0 {
 		report.WriteString("## Detailed Results\n\n")
-		report.WriteString("| Provider | Model | Mode | Total Requests | Success | Failed | Avg E2E |" +
-			" Avg TTFT | Avg Throughput |\n")
-		report.WriteString("|----------|-------|------|----------------|---------|--------|---------|" +
-			"----------|----------------|\n")
+		if targetTokens > 0 {
+			report.WriteString(fmt.Sprintf("**Note:** Projected E2E calculated for %d tokens using formula: TTFT + (Target Tokens / Throughput)\n\n", targetTokens))
+			report.WriteString("| Provider | Model | Mode | Total Requests | Success | Failed | Avg E2E |" +
+				" Avg TTFT | Avg Throughput | Projected E2E |\n")
+			report.WriteString("|----------|-------|------|----------------|---------|--------|---------|" +
+				"----------|----------------|---------------|\n")
+		} else {
+			report.WriteString("| Provider | Model | Mode | Total Requests | Success | Failed | Avg E2E |" +
+				" Avg TTFT | Avg Throughput |\n")
+			report.WriteString("|----------|-------|------|----------------|---------|--------|---------|" +
+				"----------|----------------|\n")
+		}
 
 		for _, r := range results {
-			successRate := fmt.Sprintf("%d/%d", r.Successful, r.TotalRequests)
-			failRate := fmt.Sprintf("%d", r.Failed)
-			avgE2E := NotAvailable
-			avgTTFT := NotAvailable
-			avgThroughput := NotAvailable
-
-			if r.Successful > 0 {
-				avgE2E = formatDuration(r.AvgE2ELatency)
-				avgTTFT = formatDuration(r.AvgTTFT)
-				avgThroughput = fmt.Sprintf("%.2f tok/s", r.AvgThroughput)
-			}
-
-			report.WriteString(fmt.Sprintf("| %s | %s | %s | %d | %s | %s | %s | %s | %s |\n",
-				r.Provider,
-				r.Model,
-				r.Mode,
-				r.TotalRequests,
-				successRate,
-				failRate,
-				avgE2E,
-				avgTTFT,
-				avgThroughput))
+			writeDiagnosticResultRow(&report, r, targetTokens > 0)
 		}
 		report.WriteString("\n")
 	}
@@ -1155,6 +1269,12 @@ func generateDiagnosticReport(resultsDir string, results []DiagnosticSummary, se
 				successRate))
 		}
 		report.WriteString("\n")
+
+		// Sort by Projected E2E (if available)
+		if targetTokens > 0 {
+			report.WriteString(fmt.Sprintf("### By Projected E2E Latency (%d tokens)\n\n", targetTokens))
+			writeProjectedE2EDiagnosticLeaderboard(&report, successfulResults)
+		}
 	}
 
 	// Error Analysis
@@ -1223,10 +1343,13 @@ func main() {
 	diagnostic := flag.Bool("diagnostic", false,
 		"Run diagnostic mode: 10 workers making requests every 15s for 1 minute with 30s timeout")
 	flagSaveResponses := flag.Bool("save-responses", false, "Save all API responses to log files")
+	flagTargetTokens := flag.Int("target-tokens", 350,
+		"Target token count for projected E2E latency normalization (default: 350)")
 	flag.Parse()
 
 	// Set global flag for saving responses
 	saveResponses = *flagSaveResponses
+	targetTokens = *flagTargetTokens
 
 	// 3. Create session-based folder structure
 	sessionTimestamp := time.Now().Format("20060102-150405")

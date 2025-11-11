@@ -8,6 +8,7 @@ A fast, concurrent benchmarking tool for measuring LLM API performance metrics a
 - **Multiple Provider Support**: Test OpenAI, NVIDIA NIM, NovitaAI, NebiusAI, MiniMax, and any OpenAI-compatible API
 - **Concurrent Testing**: Benchmark all providers simultaneously with `--all` flag
 - **Real Metrics**: Measures End-to-End Latency, Time to First Token (TTFT), and Throughput
+- **Projected E2E Latency**: Normalized metric for fair comparison across different token outputs
 - **Accurate Token Counting**: Uses tiktoken for precise token measurements
 - **Multi-Run Averaging**: Runs 3 concurrent iterations per provider and averages results for more reliable metrics
 - **Multiple Test Modes**: Streaming, tool-calling, and mixed modes for comprehensive testing
@@ -145,6 +146,40 @@ Diagnostic mode produces:
 ```bash
 # Test all providers in diagnostic mode
 ./llm-api-speed --all --diagnostic --mixed
+```
+
+### Projected E2E Latency Normalization
+
+The `--target-tokens` flag enables **Projected E2E Latency**, a normalized metric that allows fair performance comparison across providers that generated different token counts.
+
+**Formula:** `Projected E2E = TTFT + (Target Tokens / Throughput)`
+
+This metric answers: *"How long would this provider take to generate exactly N tokens?"*
+
+```bash
+# Calculate projected E2E for 350 tokens (default)
+./llm-api-speed --provider nim --diagnostic
+
+# Calculate projected E2E for 500 tokens
+./llm-api-speed --provider nim --diagnostic --target-tokens 500
+
+# Compare all providers normalized to 1000 tokens
+./llm-api-speed --all --diagnostic --target-tokens 1000
+```
+
+**When to use:**
+- Comparing providers that generated different completion lengths (e.g., 34 tokens vs 384 tokens)
+- Identifying the fastest provider for your expected response length
+- Understanding performance tradeoffs (TTFT vs throughput) at different scales
+
+**Output:**
+- Projected E2E appears in reports alongside actual E2E latency
+- New leaderboard: "By Projected E2E Latency" showing normalized rankings
+- JSON results include `projectedE2eLatency` field
+
+**Example:** If Provider A has TTFT=5s and throughput=250 tok/s, its projected E2E for 350 tokens would be:
+```
+5s + (350 / 250) = 5s + 1.4s = 6.4s
 ```
 
 ### Save Response Content
