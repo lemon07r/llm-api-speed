@@ -768,10 +768,10 @@ type DiagnosticSummary struct {
 	Errors        map[string]int `json:"errors,omitempty"`
 }
 
-// diagnosticMode runs continuous testing with 10 workers for 1 minute.
+// diagnosticMode runs continuous testing with 10 workers for 90 seconds.
 // Makes requests every 15 seconds, with 30-second timeout per request.
 // Workers stop starting new requests when insufficient time remains (5s grace period).
-// Expected: ~3 requests per worker (at 0s, 15s, 30s) for a total of ~30 requests.
+// Expected: 4 requests per worker (at 0s, 15s, 30s, 45s) for a total of 40 requests.
 func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resultsDir string, mode TestMode, wg *sync.WaitGroup, results *[]DiagnosticSummary, resultsMutex *sync.Mutex) {
 	if wg != nil {
 		defer wg.Done()
@@ -791,12 +791,12 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 
 	providerLogger := log.New(io.MultiWriter(os.Stdout, logFile), "", log.LstdFlags)
 	providerLogger.Printf("=== DIAGNOSTIC MODE: %s (%s) - Mode: %s ===", config.Name, config.Model, mode)
-	providerLogger.Printf("Running 10 workers for 1 minute with requests every 15 seconds")
+	providerLogger.Printf("Running 10 workers for 90 seconds with requests every 15 seconds")
 	providerLogger.Printf("Timeout per request: 30 seconds")
 
-	// Create a 1-minute timeout for the entire diagnostic session
+	// Create a 90-second timeout for the entire diagnostic session
 	sessionStartTime := time.Now()
-	sessionDuration := 1 * time.Minute
+	sessionDuration := 90 * time.Second
 	sessionCtx, sessionCancel := context.WithTimeout(context.Background(), sessionDuration)
 	defer sessionCancel()
 
@@ -1036,7 +1036,7 @@ func generateDiagnosticReport(resultsDir string, results []DiagnosticSummary, se
 	var report strings.Builder
 	report.WriteString("# LLM API Diagnostic Mode Results\n\n")
 	report.WriteString(fmt.Sprintf("**Test Session:** %s\n\n", sessionTimestamp))
-	report.WriteString("**Test Duration:** 1 minute per provider\n")
+	report.WriteString("**Test Duration:** 90 seconds per provider\n")
 	report.WriteString("**Workers:** 10 concurrent workers\n")
 	report.WriteString("**Request Frequency:** Every 15 seconds per worker\n")
 	report.WriteString("**Timeout:** 30 seconds per request\n\n")
