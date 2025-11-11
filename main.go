@@ -768,7 +768,8 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 
 				// Determine which test function to use based on mode
 				var testMode TestMode
-				if mode == ModeMixed {
+				switch mode {
+				case ModeMixed:
 					// Alternate between streaming and tool-calling in mixed mode
 					if reqNum%2 == 1 {
 						testMode = ModeStreaming
@@ -777,10 +778,10 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 						testMode = ModeToolCalling
 						e2e, ttft, throughput, tokens, responseContent, reqErr = singleToolCallRun(config, tke, providerLogger, reqCtx)
 					}
-				} else if mode == ModeToolCalling {
+				case ModeToolCalling:
 					testMode = ModeToolCalling
 					e2e, ttft, throughput, tokens, responseContent, reqErr = singleToolCallRun(config, tke, providerLogger, reqCtx)
-				} else {
+				default:
 					testMode = ModeStreaming
 					e2e, ttft, throughput, tokens, responseContent, reqErr = singleTestRun(config, tke, providerLogger, reqCtx)
 				}
