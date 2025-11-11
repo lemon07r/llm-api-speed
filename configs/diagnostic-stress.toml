@@ -1,0 +1,27 @@
+# Diagnostic Stress Test
+# 1-minute stress test with 10 concurrent workers
+
+[api_keys]
+nim = "${NIM_API_KEY}"
+novita = "${NOVITA_API_KEY}"
+
+[[groups]]
+name = "diagnostic-stress"
+description = "1-minute stress test with high concurrency"
+mode = "diagnostic"
+concurrent = false
+
+  [groups.diagnostic_params]
+  duration_seconds = 60
+  workers = 10
+  interval_seconds = 15
+  timeout_per_request_seconds = 30
+  save_responses = true
+
+  [[groups.providers]]
+  provider = "nim"
+  model = "minimaxai/minimax-m2"
+
+  [[groups.providers]]
+  provider = "novita"
+  model = "minimax/minimax-m2"

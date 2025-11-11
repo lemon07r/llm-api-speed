@@ -1,0 +1,27 @@
+# Model Comparison
+# Compare multiple models on the same provider
+
+[api_keys]
+nim = "${NIM_API_KEY}"
+
+[[groups]]
+name = "nim-model-comparison"
+description = "Compare different models on NVIDIA NIM"
+mode = "mixed"
+concurrent = false  # Sequential for fair comparison
+
+  [groups.test_params]
+  iterations = 5
+  timeout_seconds = 180
+
+  [[groups.providers]]
+  provider = "nim"
+  model = "minimaxai/minimax-m2"
+
+  [[groups.providers]]
+  provider = "nim"
+  model = "meta/llama-3.1-70b-instruct"
+
+  [[groups.providers]]
+  provider = "nim"
+  model = "mistralai/mixtral-8x7b-instruct-v0.1"

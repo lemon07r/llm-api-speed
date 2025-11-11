@@ -81,7 +81,7 @@ func singleTestRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger
 		Stream:    true,
 	}
 
-	// Execute the stream and measure metrics
+	// Start E2E timing right before sending the API request
 	startTime := time.Now()
 	var firstTokenTime time.Time
 	var fullResponseContent strings.Builder
@@ -217,7 +217,7 @@ func singleToolCallRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLo
 		Stream:    true,
 	}
 
-	// Execute the stream and measure metrics
+	// Start E2E timing right before sending the API request
 	startTime := time.Now()
 	var firstTokenTime time.Time
 	var fullResponseContent strings.Builder
@@ -321,8 +321,8 @@ func singleToolCallRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLo
 }
 
 // testProviderMetrics runs a full benchmark test against a single provider.
-// It runs 3 iterations and reports averaged results, with a 2-minute total timeout.
-func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync.WaitGroup, logDir, resultsDir string, results *[]TestResult, resultsMutex *sync.Mutex, mode TestMode) {
+// It runs iterations and reports averaged results, with configurable timeout.
+func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync.WaitGroup, logDir, resultsDir string, results *[]TestResult, resultsMutex *sync.Mutex, mode TestMode, iterations int, timeoutSeconds int) {
 	// Defer wg.Done() if this is part of a concurrent group
 	if wg != nil {
 		defer wg.Done()
@@ -341,10 +341,10 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 	providerLogger := log.New(io.MultiWriter(os.Stdout, logFile), "", log.LstdFlags)
 
 	modeStr := string(mode)
-	providerLogger.Printf("--- Testing: %s (%s) - Mode: %s - Running 3 concurrent iterations ---", config.Name, config.Model, modeStr)
+	providerLogger.Printf("--- Testing: %s (%s) - Mode: %s - Running %d concurrent iterations ---", config.Name, config.Model, modeStr, iterations)
 
-	// Create 2-minute timeout context for all runs
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	// Create timeout context for all runs
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
 	defer cancel()
 
 	// Determine which modes to run based on mode parameter
@@ -355,8 +355,8 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 		modesToRun = []TestMode{mode}
 	}
 
-	// Run 3 iterations per mode
-	const iterationsPerMode = 3
+	// Run iterations per mode
+	iterationsPerMode := iterations
 	type runResult struct {
 		e2e        time.Duration
 		ttft       time.Duration
@@ -700,9 +700,8 @@ type DiagnosticSummary struct {
 	Errors        map[string]int `json:"errors,omitempty"`
 }
 
-// diagnosticMode runs continuous testing with 10 workers for 1 minute
-// Makes 10 requests every 15 seconds, with 30-second timeout per request
-func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resultsDir string, mode TestMode, wg *sync.WaitGroup, results *[]DiagnosticSummary, resultsMutex *sync.Mutex) {
+// diagnosticMode runs continuous testing with configurable workers and duration
+func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resultsDir string, mode TestMode, wg *sync.WaitGroup, results *[]DiagnosticSummary, resultsMutex *sync.Mutex, durationSeconds int, workers int, intervalSeconds int, timeoutPerRequestSeconds int, saveResp bool) {
 	if wg != nil {
 		defer wg.Done()
 	}
@@ -716,11 +715,11 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 
 	providerLogger := log.New(io.MultiWriter(os.Stdout, logFile), "", log.LstdFlags)
 	providerLogger.Printf("=== DIAGNOSTIC MODE: %s (%s) - Mode: %s ===", config.Name, config.Model, mode)
-	providerLogger.Printf("Running 10 workers for 1 minute with requests every 15 seconds")
-	providerLogger.Printf("Timeout per request: 30 seconds")
+	providerLogger.Printf("Running %d workers for %d seconds with requests every %d seconds", workers, durationSeconds, intervalSeconds)
+	providerLogger.Printf("Timeout per request: %d seconds", timeoutPerRequestSeconds)
 
-	// Create a 1-minute timeout for the entire diagnostic session
-	sessionCtx, sessionCancel := context.WithTimeout(context.Background(), 1*time.Minute)
+	// Create a timeout for the entire diagnostic session
+	sessionCtx, sessionCancel := context.WithTimeout(context.Background(), time.Duration(durationSeconds)*time.Second)
 	defer sessionCancel()
 
 	// Metrics tracking
@@ -739,24 +738,24 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 	resultsChan := make(chan diagnosticResult, 1000)
 	var workerWg sync.WaitGroup
 
-	// Start 10 workers
-	const numWorkers = 10
+	// Start workers
+	numWorkers := workers
 	for workerID := 1; workerID <= numWorkers; workerID++ {
 		workerWg.Add(1)
 		go func(id int) {
 			defer workerWg.Done()
 			reqNum := 0
 
-			// Create ticker for requests every 15 seconds
-			ticker := time.NewTicker(15 * time.Second)
+			// Create ticker for requests
+			ticker := time.NewTicker(time.Duration(intervalSeconds) * time.Second)
 			defer ticker.Stop()
 
 			// Make first request immediately
 			for {
 				reqNum++
 
-				// Create 30-second timeout context for this request
-				reqCtx, reqCancel := context.WithTimeout(sessionCtx, 30*time.Second)
+				// Create timeout context for this request
+				reqCtx, reqCancel := context.WithTimeout(sessionCtx, time.Duration(timeoutPerRequestSeconds)*time.Second)
 
 				providerLogger.Printf("[Worker %d] Request #%d starting", id, reqNum)
 
@@ -789,7 +788,7 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 				reqCancel()
 
 				// Save response if flag is enabled
-				if saveResponses && reqErr == nil && responseContent != "" {
+				if saveResp && reqErr == nil && responseContent != "" {
 					responseFile := filepath.Join(logDir, fmt.Sprintf("%s-worker%d-req%d-%s-response.txt", config.Name, id, reqNum, testMode))
 					if err := os.WriteFile(responseFile, []byte(responseContent), 0644); err != nil {
 						providerLogger.Printf("[Worker %d] Warning: Failed to save response for request #%d: %v", id, reqNum, err)
@@ -1085,6 +1084,220 @@ func generateDiagnosticReport(resultsDir string, results []DiagnosticSummary, se
 	return nil
 }
 
+// runTOMLConfigMode handles execution when TOML config is provided
+func runTOMLConfigMode(configPath string, groupName string, listGroupsFlag bool) {
+	// Load configuration
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		log.Fatalf("Error loading config: %v", err)
+	}
+
+	// List groups if requested
+	if listGroupsFlag {
+		ListGroups(cfg)
+		return
+	}
+
+	// Initialize tokenizer
+	tke, err := tiktoken.GetEncoding("cl100k_base")
+	if err != nil {
+		log.Fatalf("Error getting tokenizer: %v\n(You might need to run: go get github.com/pkoukk/tiktoken-go)", err)
+	}
+
+	// Determine which groups to run
+	var groupsToRun []TestGroup
+	if groupName != "" {
+		// Run specific group
+		group, err := GetGroupByName(cfg, groupName)
+		if err != nil {
+			log.Fatalf("Error: %v\n\nUse --list-groups to see available groups", err)
+		}
+		groupsToRun = append(groupsToRun, *group)
+	} else {
+		// Run all groups
+		groupsToRun = cfg.Groups
+	}
+
+	// Create session directory
+	sessionTimestamp := time.Now().Format("20060102-150405")
+	sessionDir := filepath.Join(cfg.Global.ResultsDir, fmt.Sprintf("session-%s", sessionTimestamp))
+	logDir := filepath.Join(sessionDir, "logs")
+	resultsDir := sessionDir
+
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		log.Fatalf("Error creating logs directory: %v", err)
+	}
+
+	if err := os.MkdirAll(resultsDir, 0755); err != nil {
+		log.Fatalf("Error creating results directory: %v", err)
+	}
+
+	log.Printf("Session folder: %s/", sessionDir)
+	log.Printf("Configuration: %s", configPath)
+	log.Printf("Groups to run: %d", len(groupsToRun))
+
+	// Run test groups
+	for _, group := range groupsToRun {
+		log.Printf("\n=== Running Test Group: %s ===", group.Name)
+		if group.Description != "" {
+			log.Printf("Description: %s", group.Description)
+		}
+		runTestGroup(group, cfg, sessionDir, tke)
+	}
+
+	log.Printf("\nAll tests complete. Results saved to: %s/", sessionDir)
+}
+
+// runTestGroup executes a single test group
+func runTestGroup(group TestGroup, cfg *Config, sessionDir string, tke *tiktoken.Tiktoken) {
+	logDir := filepath.Join(sessionDir, "logs")
+	resultsDir := sessionDir
+
+	// Determine test mode
+	var testMode TestMode
+	switch group.Mode {
+	case "streaming":
+		testMode = ModeStreaming
+	case "tool-calling":
+		testMode = ModeToolCalling
+	case "mixed":
+		testMode = ModeMixed
+	case "diagnostic":
+		testMode = ModeMixed // Diagnostic mode will be handled separately
+	default:
+		log.Fatalf("Invalid mode '%s' for group '%s'", group.Mode, group.Name)
+	}
+
+	// Convert group providers to ProviderConfig
+	providerConfigs := make([]ProviderConfig, 0, len(group.Providers))
+	for _, gpc := range group.Providers {
+		pc, err := ConvertGroupToProviderConfig(gpc, cfg.APIKeys)
+		if err != nil {
+			log.Printf("Warning: Skipping provider in group '%s': %v", group.Name, err)
+			continue
+		}
+		providerConfigs = append(providerConfigs, pc)
+	}
+
+	if len(providerConfigs) == 0 {
+		log.Printf("Warning: No valid providers in group '%s'", group.Name)
+		return
+	}
+
+	// Execute based on mode
+	if group.Mode == "diagnostic" {
+		executeDiagnosticTest(group, providerConfigs, cfg, logDir, resultsDir, tke)
+	} else {
+		executeStandardTest(group, providerConfigs, cfg, logDir, resultsDir, testMode, tke)
+	}
+}
+
+// executeStandardTest runs standard benchmark tests for a group
+func executeStandardTest(group TestGroup, providerConfigs []ProviderConfig, cfg *Config, logDir, resultsDir string, testMode TestMode, tke *tiktoken.Tiktoken) {
+	// Get test parameters with defaults
+	iterations := 3
+	timeoutSeconds := 120
+	saveResp := cfg.Global.SaveResponses
+
+	if group.TestParams != nil {
+		iterations = group.TestParams.Iterations
+		timeoutSeconds = group.TestParams.TimeoutSeconds
+		if group.TestParams.SaveResponses {
+			saveResp = true
+		}
+	}
+
+	log.Printf("Test parameters: iterations=%d, timeout=%ds, save_responses=%v, concurrent=%v",
+		iterations, timeoutSeconds, saveResp, group.Concurrent)
+
+	// Set global save responses flag
+	oldSaveResponses := saveResponses
+	saveResponses = saveResp
+	defer func() { saveResponses = oldSaveResponses }()
+
+	var results []TestResult
+	var resultsMutex sync.Mutex
+
+	if group.Concurrent {
+		// Run all providers concurrently
+		var wg sync.WaitGroup
+		for _, provider := range providerConfigs {
+			wg.Add(1)
+			go testProviderMetrics(provider, tke, &wg, logDir, resultsDir, &results, &resultsMutex, testMode, iterations, timeoutSeconds)
+		}
+		wg.Wait()
+	} else {
+		// Run providers sequentially
+		for _, provider := range providerConfigs {
+			testProviderMetrics(provider, tke, nil, logDir, resultsDir, &results, &resultsMutex, testMode, iterations, timeoutSeconds)
+		}
+	}
+
+	// Generate group-specific report
+	sessionTimestamp := time.Now().Format("20060102-150405")
+	generateMarkdownReport(resultsDir, results, sessionTimestamp)
+	log.Printf("Group '%s' complete. %d providers tested.", group.Name, len(providerConfigs))
+}
+
+// executeDiagnosticTest runs diagnostic tests for a group
+func executeDiagnosticTest(group TestGroup, providerConfigs []ProviderConfig, cfg *Config, logDir, resultsDir string, tke *tiktoken.Tiktoken) {
+	// Get diagnostic parameters with defaults
+	durationSeconds := 60
+	workers := 10
+	intervalSeconds := 15
+	timeoutPerRequestSeconds := 30
+	saveResp := cfg.Global.SaveResponses
+
+	if group.DiagnosticParams != nil {
+		durationSeconds = group.DiagnosticParams.DurationSeconds
+		workers = group.DiagnosticParams.Workers
+		intervalSeconds = group.DiagnosticParams.IntervalSeconds
+		timeoutPerRequestSeconds = group.DiagnosticParams.TimeoutPerRequestSeconds
+		if group.DiagnosticParams.SaveResponses {
+			saveResp = true
+		}
+	}
+
+	log.Printf("Diagnostic parameters: duration=%ds, workers=%d, interval=%ds, timeout_per_request=%ds, concurrent=%v",
+		durationSeconds, workers, intervalSeconds, timeoutPerRequestSeconds, group.Concurrent)
+
+	var diagnosticResults []DiagnosticSummary
+	var diagnosticMutex sync.Mutex
+
+	// Determine test mode for diagnostic
+	var testMode TestMode
+	if group.Mode == "diagnostic" {
+		testMode = ModeMixed // Default for diagnostic mode
+	} else {
+		testMode = ModeMixed
+	}
+
+	if group.Concurrent {
+		// Run all providers concurrently
+		var wg sync.WaitGroup
+		for _, provider := range providerConfigs {
+			wg.Add(1)
+			go diagnosticMode(provider, tke, logDir, resultsDir, testMode, &wg, &diagnosticResults, &diagnosticMutex,
+				durationSeconds, workers, intervalSeconds, timeoutPerRequestSeconds, saveResp)
+		}
+		wg.Wait()
+	} else {
+		// Run providers sequentially
+		for _, provider := range providerConfigs {
+			diagnosticMode(provider, tke, logDir, resultsDir, testMode, nil, &diagnosticResults, &diagnosticMutex,
+				durationSeconds, workers, intervalSeconds, timeoutPerRequestSeconds, saveResp)
+		}
+	}
+
+	// Generate diagnostic report
+	sessionTimestamp := time.Now().Format("20060102-150405")
+	if err := generateDiagnosticReport(resultsDir, diagnosticResults, sessionTimestamp); err != nil {
+		log.Printf("Warning: Failed to generate diagnostic report: %v", err)
+	}
+
+	log.Printf("Diagnostic group '%s' complete. %d providers tested.", group.Name, len(providerConfigs))
+}
+
 func main() {
 	// --- Define Provider static info ---
 	providerBaseURLs := map[string]string{
@@ -1102,6 +1315,12 @@ func main() {
 	}
 
 	// 2. Parse Command-Line Flags
+	// New TOML config flags
+	configFile := flag.String("config", "", "Path to TOML configuration file")
+	groupName := flag.String("group", "", "Run specific test group from config")
+	listGroups := flag.Bool("list-groups", false, "List available test groups in config")
+
+	// Legacy flags for backward compatibility
 	providerName := flag.String("provider", "", "Specific provider to test (e.g., nim, novita). If empty, tests 'generic' provider.")
 	testAll := flag.Bool("all", false, "Test all configured providers concurrently.")
 	flagGenericURL := flag.String("url", "", "Override Base URL for 'generic' provider (default: https://openrouter.ai/api/v1)")
@@ -1114,6 +1333,12 @@ func main() {
 
 	// Set global flag for saving responses
 	saveResponses = *flagSaveResponses
+
+	// 3. Check if TOML config mode
+	if *configFile != "" {
+		runTOMLConfigMode(*configFile, *groupName, *listGroups)
+		return
+	}
 
 	// 3. Create session-based folder structure
 	sessionTimestamp := time.Now().Format("20060102-150405")
@@ -1268,13 +1493,13 @@ func main() {
 			var diagnosticWg sync.WaitGroup
 			for _, provider := range providersToTest {
 				diagnosticWg.Add(1)
-				go diagnosticMode(provider, tke, logDir, resultsDir, testMode, &diagnosticWg, &diagnosticResults, &diagnosticMutex)
+				go diagnosticMode(provider, tke, logDir, resultsDir, testMode, &diagnosticWg, &diagnosticResults, &diagnosticMutex, 60, 10, 15, 30, *flagSaveResponses)
 			}
 			diagnosticWg.Wait()
 		} else {
 			// Single provider (no concurrency needed)
 			for _, provider := range providersToTest {
-				diagnosticMode(provider, tke, logDir, resultsDir, testMode, nil, &diagnosticResults, &diagnosticMutex)
+				diagnosticMode(provider, tke, logDir, resultsDir, testMode, nil, &diagnosticResults, &diagnosticMutex, 60, 10, 15, 30, *flagSaveResponses)
 			}
 		}
 
@@ -1297,10 +1522,10 @@ func main() {
 		if *testAll {
 			// Run all tests concurrently
 			wg.Add(1)
-			go testProviderMetrics(provider, tke, &wg, logDir, resultsDir, &results, &resultsMutex, testMode)
+			go testProviderMetrics(provider, tke, &wg, logDir, resultsDir, &results, &resultsMutex, testMode, 3, 120)
 		} else {
 			// Run a single test sequentially
-			testProviderMetrics(provider, tke, nil, logDir, resultsDir, &results, &resultsMutex, testMode)
+			testProviderMetrics(provider, tke, nil, logDir, resultsDir, &results, &resultsMutex, testMode, 3, 120)
 		}
 	}
 

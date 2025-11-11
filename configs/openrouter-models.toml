@@ -1,0 +1,35 @@
+# OpenRouter Model Comparison
+# Compare different models available on OpenRouter
+
+[api_keys]
+generic = "${OAI_API_KEY}"
+
+[[groups]]
+name = "openrouter-models"
+description = "Compare popular models on OpenRouter"
+mode = "mixed"
+concurrent = false
+
+  [groups.test_params]
+  iterations = 5
+  timeout_seconds = 180
+
+  [[groups.providers]]
+  provider = "generic"
+  model = "anthropic/claude-3.5-sonnet"
+  base_url = "https://openrouter.ai/api/v1"
+
+  [[groups.providers]]
+  provider = "generic"
+  model = "meta-llama/llama-3.1-70b-instruct"
+  base_url = "https://openrouter.ai/api/v1"
+
+  [[groups.providers]]
+  provider = "generic"
+  model = "google/gemini-pro-1.5"
+  base_url = "https://openrouter.ai/api/v1"
+
+  [[groups.providers]]
+  provider = "generic"
+  model = "mistralai/mixtral-8x7b-instruct"
+  base_url = "https://openrouter.ai/api/v1"

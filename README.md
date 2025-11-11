@@ -65,7 +65,35 @@ cp example.env .env
 
 ## Usage
 
-### Basic Usage
+### TOML Configuration (Recommended)
+
+The most flexible way to run tests is using TOML configuration files. This allows you to:
+- Test multiple models across multiple providers in one run
+- Create reusable test configurations
+- Fine-tune test parameters per group
+- Run sequential or concurrent tests
+
+```bash
+# List available test groups
+./llm-api-speed --config config.toml --list-groups
+
+# Run all groups in config
+./llm-api-speed --config example.config.toml
+
+# Run specific group
+./llm-api-speed --config example.config.toml --group quick-provider-comparison
+
+# Use preset configurations
+./llm-api-speed --config configs/quick-comparison.toml
+./llm-api-speed --config configs/diagnostic-stress.toml
+./llm-api-speed --config configs/model-comparison.toml
+```
+
+See `example.config.toml` for a comprehensive configuration example, or check the `configs/` directory for preset configurations.
+
+### Legacy CLI Usage (Backward Compatible)
+
+The original CLI flags still work for quick tests:
 
 ```bash
 # Generic provider with custom API endpoint
@@ -199,7 +227,47 @@ results/session-20251110-004615/
 
 ## Configuration
 
-Copy `example.env` to `.env` and configure:
+### TOML Configuration Files
+
+Create a TOML file to define test groups with multiple providers and models:
+
+```toml
+# API Keys - can reference environment variables
+[api_keys]
+nim = "${NIM_API_KEY}"
+novita = "${NOVITA_API_KEY}"
+generic = "${OAI_API_KEY}"
+
+# Test Group
+[[groups]]
+name = "provider-comparison"
+description = "Compare multiple providers"
+mode = "streaming"  # streaming | tool-calling | mixed | diagnostic
+concurrent = true   # Run all providers in parallel
+
+  [groups.test_params]
+  iterations = 3
+  timeout_seconds = 120
+  save_responses = false
+
+  [[groups.providers]]
+  provider = "nim"
+  model = "minimaxai/minimax-m2"
+
+  [[groups.providers]]
+  provider = "novita"
+  model = "minimax/minimax-m2"
+
+  [[groups.providers]]
+  provider = "generic"
+  model = "meta-llama/llama-3.1-8b-instruct"
+```
+
+See `example.config.toml` for all available options and `CONFIGURATION.md` for detailed documentation.
+
+### Environment Variables (.env)
+
+For legacy CLI usage or to store API keys referenced in TOML configs:
 
 ```env
 # Generic provider (uses --url flag or defaults to OpenRouter)

@@ -1,0 +1,114 @@
+# LLM API Speed Test Configuration
+# This file demonstrates all available configuration options
+
+# Global settings (optional, can be overridden per group)
+[global]
+save_responses = false
+log_level = "info"
+timeout_seconds = 120
+results_dir = "results"
+
+# API Keys - can reference environment variables
+# Use ${VAR_NAME} or $VAR_NAME syntax
+[api_keys]
+openai = "${OPENAI_API_KEY}"
+nim = "${NIM_API_KEY}"
+novita = "${NOVITA_API_KEY}"
+nebius = "${NEBIUS_API_KEY}"
+minimax = "${MINIMAX_API_KEY}"
+nahcrof = "${NAHCROF_API_KEY}"
+generic = "${OAI_API_KEY}"
+
+# Test Group 1: Quick provider comparison
+[[groups]]
+name = "quick-provider-comparison"
+description = "Fast comparison across multiple providers"
+mode = "streaming"  # Options: streaming | tool-calling | mixed | diagnostic
+concurrent = true   # Run all providers in parallel
+
+  # Test parameters (optional, uses defaults if not specified)
+  [groups.test_params]
+  iterations = 3              # Number of test iterations (default: 3)
+  timeout_seconds = 120       # Timeout for entire test (default: 120)
+  save_responses = false      # Save API responses to files (default: false)
+
+  # Provider configurations
+  [[groups.providers]]
+  provider = "nim"
+  model = "minimaxai/minimax-m2"
+  base_url = "https://integrate.api.nvidia.com/v1"  # Optional, uses default if not specified
+
+  [[groups.providers]]
+  provider = "novita"
+  model = "minimaxai/minimax-m2"
+  
+  [[groups.providers]]
+  provider = "generic"
+  model = "meta-llama/llama-3.1-8b-instruct"
+  base_url = "https://openrouter.ai/api/v1"
+
+# Test Group 2: Diagnostic mode testing
+[[groups]]
+name = "diagnostic-stress-test"
+description = "1-minute stress test with high concurrency"
+mode = "diagnostic"
+concurrent = false  # Run providers sequentially
+
+  # Diagnostic parameters (only for diagnostic mode)
+  [groups.diagnostic_params]
+  duration_seconds = 60                   # How long to run test (default: 60)
+  workers = 10                            # Number of concurrent workers (default: 10)
+  interval_seconds = 15                   # Time between requests per worker (default: 15)
+  timeout_per_request_seconds = 30        # Timeout for each request (default: 30)
+  save_responses = true                   # Save all responses (default: false)
+
+  [[groups.providers]]
+  provider = "nim"
+  model = "minimaxai/minimax-m2"
+
+# Test Group 3: Model comparison on same provider
+[[groups]]
+name = "nim-model-comparison"
+description = "Compare different models on NVIDIA NIM"
+mode = "mixed"       # Test both streaming and tool-calling
+concurrent = false   # Run sequentially for fair comparison
+
+  [groups.test_params]
+  iterations = 5       # More iterations for better accuracy
+  timeout_seconds = 180
+
+  [[groups.providers]]
+  provider = "nim"
+  model = "minimaxai/minimax-m2"
+
+  [[groups.providers]]
+  provider = "nim"
+  model = "meta/llama-3.1-70b-instruct"
+  
+  [[groups.providers]]
+  provider = "nim"
+  model = "mistralai/mixtral-8x7b-instruct-v0.1"
+
+# Test Group 4: Tool-calling performance
+[[groups]]
+name = "tool-calling-comparison"
+description = "Compare tool-calling performance across providers"
+mode = "tool-calling"
+concurrent = true
+
+  [groups.test_params]
+  iterations = 3
+  timeout_seconds = 120
+
+  [[groups.providers]]
+  provider = "nim"
+  model = "minimaxai/minimax-m2"
+
+  [[groups.providers]]
+  provider = "novita"
+  model = "minimax/minimax-m2"
+
+  [[groups.providers]]
+  provider = "generic"
+  model = "anthropic/claude-3.5-sonnet"
+  base_url = "https://openrouter.ai/api/v1"
