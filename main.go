@@ -96,13 +96,14 @@ func singleTestRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger
 
 	chunkCount := 0
 	nonEmptyChunks := 0
+	reasoningChunks := 0
 
 	for {
 		response, recvErr := stream.Recv()
 
 		// Check for end of stream
 		if errors.Is(recvErr, io.EOF) {
-			providerLogger.Printf("[%s] ... Stream complete. Received %d chunks (%d non-empty)", config.Name, chunkCount, nonEmptyChunks)
+			providerLogger.Printf("[%s] ... Stream complete. Received %d chunks (%d content, %d reasoning)", config.Name, chunkCount, nonEmptyChunks, reasoningChunks)
 			break
 		}
 
@@ -117,23 +118,38 @@ func singleTestRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger
 
 		// Check if Choices array is empty
 		if len(response.Choices) == 0 {
-			providerLogger.Printf("[%s] ... Chunk %d: Empty Choices array", config.Name, chunkCount)
+			// Log occasionally for debugging (every 100 chunks), not every single one
+			if chunkCount%100 == 0 {
+				providerLogger.Printf("[%s] ... Chunk %d: Empty Choices array (diagnostic: ID=%s, Model=%s)", 
+					config.Name, chunkCount, response.ID, response.Model)
+			}
 			continue
 		}
 
-		// Get the content from the first choice
-		content := response.Choices[0].Delta.Content
+		delta := response.Choices[0].Delta
 
-		// Check if this is the first chunk with actual text
-		if content != "" && firstTokenTime.IsZero() {
+		// Get both regular content and reasoning content (for thinking models)
+		content := delta.Content
+		reasoningContent := delta.ReasoningContent
+
+		// Check if this is the first chunk with actual text (either type)
+		if (content != "" || reasoningContent != "") && firstTokenTime.IsZero() {
 			firstTokenTime = time.Now()
-			providerLogger.Printf("[%s] ... First token received! (chunk %d, len=%d)", config.Name, chunkCount, len(content))
+			if reasoningContent != "" {
+				providerLogger.Printf("[%s] ... First token received (reasoning)! (chunk %d, len=%d)", config.Name, chunkCount, len(reasoningContent))
+			} else {
+				providerLogger.Printf("[%s] ... First token received! (chunk %d, len=%d)", config.Name, chunkCount, len(content))
+			}
 		}
 
-		// Append the content to our builder
+		// Append both types of content
 		if content != "" {
 			nonEmptyChunks++
 			fullResponseContent.WriteString(content)
+		}
+		if reasoningContent != "" {
+			reasoningChunks++
+			fullResponseContent.WriteString(reasoningContent)
 		}
 	}
 
@@ -232,13 +248,16 @@ func singleToolCallRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLo
 
 	chunkCount := 0
 	nonEmptyChunks := 0
+	reasoningChunks := 0
+	toolCallChunks := 0
 
 	for {
 		response, recvErr := stream.Recv()
 
 		// Check for end of stream
 		if errors.Is(recvErr, io.EOF) {
-			providerLogger.Printf("[%s] ... Tool calling stream complete. Received %d chunks (%d non-empty)", config.Name, chunkCount, nonEmptyChunks)
+			providerLogger.Printf("[%s] ... Tool calling stream complete. Received %d chunks (%d content, %d reasoning, %d tool)", 
+				config.Name, chunkCount, nonEmptyChunks, reasoningChunks, toolCallChunks)
 			break
 		}
 
@@ -253,31 +272,48 @@ func singleToolCallRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLo
 
 		// Check if Choices array is empty
 		if len(response.Choices) == 0 {
-			providerLogger.Printf("[%s] ... Chunk %d: Empty Choices array", config.Name, chunkCount)
+			// Log occasionally for debugging (every 100 chunks), not every single one
+			if chunkCount%100 == 0 {
+				providerLogger.Printf("[%s] ... Chunk %d: Empty Choices array (diagnostic: ID=%s, Model=%s)", 
+					config.Name, chunkCount, response.ID, response.Model)
+			}
 			continue
 		}
 
-		choice := response.Choices[0]
+		delta := response.Choices[0].Delta
 
-		// Check for first token (either content or tool call)
-		hasContent := choice.Delta.Content != ""
-		hasToolCall := len(choice.Delta.ToolCalls) > 0
+		// Check for first token (content, reasoning, or tool call)
+		hasContent := delta.Content != ""
+		hasReasoningContent := delta.ReasoningContent != ""
+		hasToolCall := len(delta.ToolCalls) > 0
 
-		if (hasContent || hasToolCall) && firstTokenTime.IsZero() {
+		if (hasContent || hasReasoningContent || hasToolCall) && firstTokenTime.IsZero() {
 			firstTokenTime = time.Now()
-			providerLogger.Printf("[%s] ... First token received (tool-calling)! (chunk %d)", config.Name, chunkCount)
+			if hasReasoningContent {
+				providerLogger.Printf("[%s] ... First token received (reasoning, tool-calling)! (chunk %d)", config.Name, chunkCount)
+			} else if hasToolCall {
+				providerLogger.Printf("[%s] ... First token received (tool-call)! (chunk %d)", config.Name, chunkCount)
+			} else {
+				providerLogger.Printf("[%s] ... First token received (tool-calling)! (chunk %d)", config.Name, chunkCount)
+			}
 		}
 
 		// Append content if present
 		if hasContent {
 			nonEmptyChunks++
-			fullResponseContent.WriteString(choice.Delta.Content)
+			fullResponseContent.WriteString(delta.Content)
+		}
+
+		// Append reasoning content if present
+		if hasReasoningContent {
+			reasoningChunks++
+			fullResponseContent.WriteString(delta.ReasoningContent)
 		}
 
 		// Append tool call information as text for token counting
 		if hasToolCall {
-			nonEmptyChunks++
-			for _, toolCall := range choice.Delta.ToolCalls {
+			toolCallChunks++
+			for _, toolCall := range delta.ToolCalls {
 				if toolCall.Function.Name != "" {
 					fullResponseContent.WriteString(toolCall.Function.Name)
 				}
@@ -343,8 +379,8 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 	modeStr := string(mode)
 	providerLogger.Printf("--- Testing: %s (%s) - Mode: %s - Running 3 concurrent iterations ---", config.Name, config.Model, modeStr)
 
-	// Create 2-minute timeout context for all runs
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	// Create 5-minute timeout context for all runs (reasoning models can be slow)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	// Determine which modes to run based on mode parameter
@@ -717,7 +753,7 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 	providerLogger := log.New(io.MultiWriter(os.Stdout, logFile), "", log.LstdFlags)
 	providerLogger.Printf("=== DIAGNOSTIC MODE: %s (%s) - Mode: %s ===", config.Name, config.Model, mode)
 	providerLogger.Printf("Running 10 workers for 1 minute with requests every 15 seconds")
-	providerLogger.Printf("Timeout per request: 30 seconds")
+	providerLogger.Printf("Timeout per request: 60 seconds")
 
 	// Create a 1-minute timeout for the entire diagnostic session
 	sessionCtx, sessionCancel := context.WithTimeout(context.Background(), 1*time.Minute)
@@ -755,8 +791,8 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 			for {
 				reqNum++
 
-				// Create 30-second timeout context for this request
-				reqCtx, reqCancel := context.WithTimeout(sessionCtx, 30*time.Second)
+				// Create 60-second timeout context for this request (reasoning models are slow)
+				reqCtx, reqCancel := context.WithTimeout(sessionCtx, 60*time.Second)
 
 				providerLogger.Printf("[Worker %d] Request #%d starting", id, reqNum)
 
@@ -934,7 +970,7 @@ func generateDiagnosticReport(resultsDir string, results []DiagnosticSummary, se
 	report.WriteString("**Test Duration:** 1 minute per provider\n")
 	report.WriteString("**Workers:** 10 concurrent workers\n")
 	report.WriteString("**Request Frequency:** Every 15 seconds per worker\n")
-	report.WriteString("**Timeout:** 30 seconds per request\n\n")
+	report.WriteString("**Timeout:** 60 seconds per request\n\n")
 	report.WriteString("---\n\n")
 
 	// Summary statistics
