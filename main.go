@@ -120,7 +120,7 @@ func singleTestRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger
 		if len(response.Choices) == 0 {
 			// Log occasionally for debugging (every 100 chunks), not every single one
 			if chunkCount%100 == 0 {
-				providerLogger.Printf("[%s] ... Chunk %d: Empty Choices array (diagnostic: ID=%s, Model=%s)", 
+				providerLogger.Printf("[%s] ... Chunk %d: Empty Choices array (diagnostic: ID=%s, Model=%s)",
 					config.Name, chunkCount, response.ID, response.Model)
 			}
 			continue
@@ -256,7 +256,7 @@ func singleToolCallRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLo
 
 		// Check for end of stream
 		if errors.Is(recvErr, io.EOF) {
-			providerLogger.Printf("[%s] ... Tool calling stream complete. Received %d chunks (%d content, %d reasoning, %d tool)", 
+			providerLogger.Printf("[%s] ... Tool calling stream complete. Received %d chunks (%d content, %d reasoning, %d tool)",
 				config.Name, chunkCount, nonEmptyChunks, reasoningChunks, toolCallChunks)
 			break
 		}
@@ -274,7 +274,7 @@ func singleToolCallRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLo
 		if len(response.Choices) == 0 {
 			// Log occasionally for debugging (every 100 chunks), not every single one
 			if chunkCount%100 == 0 {
-				providerLogger.Printf("[%s] ... Chunk %d: Empty Choices array (diagnostic: ID=%s, Model=%s)", 
+				providerLogger.Printf("[%s] ... Chunk %d: Empty Choices array (diagnostic: ID=%s, Model=%s)",
 					config.Name, chunkCount, response.ID, response.Model)
 			}
 			continue
