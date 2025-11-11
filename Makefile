@@ -1,4 +1,4 @@
-.PHONY: all build test clean install fmt vet deps release-build
+.PHONY: all build test clean install fmt vet lint deps release-build
 
 # Binary name
 BINARY_NAME=llm-api-speed
@@ -12,7 +12,7 @@ VERSION?=$(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 # Build flags
 LDFLAGS=-ldflags "-s -w"
 
-all: deps fmt vet test build
+all: deps fmt vet lint test build
 
 deps:
 	@echo "Downloading dependencies..."
@@ -33,6 +33,10 @@ fmt:
 vet:
 	@echo "Running go vet..."
 	@go vet ./...
+
+lint:
+	@echo "Running golangci-lint..."
+	@golangci-lint run ./...
 
 clean:
 	@echo "Cleaning up..."
@@ -64,12 +68,13 @@ release-build: clean
 
 help:
 	@echo "Available targets:"
-	@echo "  all           - Run deps, fmt, vet, test, and build (default)"
+	@echo "  all           - Run deps, fmt, vet, lint, test, and build (default)"
 	@echo "  deps          - Download dependencies"
 	@echo "  build         - Build the binary"
 	@echo "  test          - Run tests"
 	@echo "  fmt           - Format code"
 	@echo "  vet           - Run go vet"
+	@echo "  lint          - Run golangci-lint"
 	@echo "  clean         - Remove build artifacts"
 	@echo "  install       - Install binary to GOPATH/bin"
 	@echo "  release-build - Build binaries for all platforms"

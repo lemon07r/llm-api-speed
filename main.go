@@ -737,7 +737,9 @@ type DiagnosticSummary struct {
 }
 
 // diagnosticMode runs continuous testing with 10 workers for 1 minute
-// Makes 10 requests every 15 seconds, with 30-second timeout per request
+// Makes requests every 15 seconds, with 30-second timeout per request
+// Workers stop starting new requests when insufficient time remains (5s grace period)
+// Expected: ~3 requests per worker (at 0s, 15s, 30s) for a total of ~30 requests
 func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resultsDir string, mode TestMode, wg *sync.WaitGroup, results *[]DiagnosticSummary, resultsMutex *sync.Mutex) {
 	if wg != nil {
 		defer wg.Done()
@@ -753,11 +755,17 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 	providerLogger := log.New(io.MultiWriter(os.Stdout, logFile), "", log.LstdFlags)
 	providerLogger.Printf("=== DIAGNOSTIC MODE: %s (%s) - Mode: %s ===", config.Name, config.Model, mode)
 	providerLogger.Printf("Running 10 workers for 1 minute with requests every 15 seconds")
-	providerLogger.Printf("Timeout per request: 60 seconds")
+	providerLogger.Printf("Timeout per request: 30 seconds")
 
 	// Create a 1-minute timeout for the entire diagnostic session
-	sessionCtx, sessionCancel := context.WithTimeout(context.Background(), 1*time.Minute)
+	sessionStartTime := time.Now()
+	sessionDuration := 1 * time.Minute
+	sessionCtx, sessionCancel := context.WithTimeout(context.Background(), sessionDuration)
 	defer sessionCancel()
+
+	// Define timeout constants
+	const requestTimeout = 30 * time.Second
+	const gracePeriod = 5 * time.Second
 
 	// Metrics tracking
 	type diagnosticResult struct {
@@ -791,8 +799,8 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 			for {
 				reqNum++
 
-				// Create 60-second timeout context for this request (reasoning models are slow)
-				reqCtx, reqCancel := context.WithTimeout(sessionCtx, 60*time.Second)
+				// Create timeout context for this request
+				reqCtx, reqCancel := context.WithTimeout(sessionCtx, requestTimeout)
 
 				providerLogger.Printf("[Worker %d] Request #%d starting", id, reqNum)
 
@@ -857,6 +865,17 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 					providerLogger.Printf("[Worker %d] Session ended, completed %d requests", id, reqNum)
 					return
 				case <-ticker.C:
+					// Check if there's enough time remaining before starting the next request
+					elapsed := time.Since(sessionStartTime)
+					timeRemaining := sessionDuration - elapsed
+
+					// Skip new requests if insufficient time remains
+					if timeRemaining < requestTimeout+gracePeriod {
+						providerLogger.Printf("[Worker %d] Stopping - insufficient time remaining for next request (%.1fs left, need %.1fs)",
+							id, timeRemaining.Seconds(), (requestTimeout + gracePeriod).Seconds())
+						providerLogger.Printf("[Worker %d] Completed %d requests", id, reqNum)
+						return
+					}
 					// Continue to next request
 				}
 			}
@@ -970,7 +989,7 @@ func generateDiagnosticReport(resultsDir string, results []DiagnosticSummary, se
 	report.WriteString("**Test Duration:** 1 minute per provider\n")
 	report.WriteString("**Workers:** 10 concurrent workers\n")
 	report.WriteString("**Request Frequency:** Every 15 seconds per worker\n")
-	report.WriteString("**Timeout:** 60 seconds per request\n\n")
+	report.WriteString("**Timeout:** 30 seconds per request\n\n")
 	report.WriteString("---\n\n")
 
 	// Summary statistics

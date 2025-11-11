@@ -24,6 +24,9 @@ jobs:
     - name: Run go vet
       run: make vet
 
+    - name: Run linter
+      run: make lint
+
     - name: Check formatting
       run: |
         make fmt
