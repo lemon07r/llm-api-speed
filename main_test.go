@@ -35,8 +35,14 @@ func TestEnvironmentVariables(t *testing.T) {
 	testKey := "TEST_API_KEY"
 	testValue := "test-value-12345"
 
-	os.Setenv(testKey, testValue)
-	defer os.Unsetenv(testKey)
+	if err := os.Setenv(testKey, testValue); err != nil {
+		t.Fatalf("Failed to set environment variable: %v", err)
+	}
+	defer func() {
+		if err := os.Unsetenv(testKey); err != nil {
+			t.Logf("Warning: Failed to unset environment variable: %v", err)
+		}
+	}()
 
 	value := os.Getenv(testKey)
 	if value != testValue {

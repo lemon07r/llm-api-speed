@@ -1,3 +1,4 @@
+// Package main implements an LLM API speed testing tool.
 package main
 
 import (
@@ -19,7 +20,7 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 )
 
-// ProviderConfig holds all info for one API provider
+// ProviderConfig holds all info for one API provider.
 type ProviderConfig struct {
 	Name    string
 	BaseURL string
@@ -27,46 +28,51 @@ type ProviderConfig struct {
 	Model   string
 }
 
-// TestResult holds the benchmark results for a provider
+// TestResult holds the benchmark results for a provider.
 type TestResult struct {
 	Provider         string        `json:"provider"`
 	Model            string        `json:"model"`
 	Timestamp        time.Time     `json:"timestamp"`
-	E2ELatency       time.Duration `json:"e2e_latency_ms"`
-	TTFT             time.Duration `json:"ttft_ms"`
-	Throughput       float64       `json:"throughput_tokens_per_sec"`
-	CompletionTokens int           `json:"completion_tokens"`
+	E2ELatency       time.Duration `json:"e2eLatencyMs"`
+	TTFT             time.Duration `json:"ttftMs"`
+	Throughput       float64       `json:"throughputTokensPerSec"`
+	CompletionTokens int           `json:"completionTokens"`
 	Success          bool          `json:"success"`
 	Error            string        `json:"error,omitempty"`
 	Mode             string        `json:"mode"`
 }
 
-// TestMode represents the type of test being performed
+// TestMode represents the type of test being performed.
 type TestMode string
 
 const (
-	ModeStreaming   TestMode = "streaming"
+	// ModeStreaming represents streaming mode testing.
+	ModeStreaming TestMode = "streaming"
+	// ModeToolCalling represents tool-calling mode testing.
 	ModeToolCalling TestMode = "tool-calling"
-	ModeMixed       TestMode = "mixed"
+	// ModeMixed represents mixed mode testing (both streaming and tool-calling).
+	ModeMixed TestMode = "mixed"
+	// NotAvailable is a constant for unavailable metrics.
+	NotAvailable = "N/A"
 )
 
-// formatDuration formats a duration as decimal seconds
+// formatDuration formats a duration as decimal seconds.
 func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%.3fs", d.Seconds())
 }
 
-// Global flag for saving responses
 var saveResponses bool
 
-// singleTestRun performs one test run and returns metrics or error
-func singleTestRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger *log.Logger, ctx context.Context) (e2e, ttft time.Duration, throughput float64, tokens int, response string, err error) {
+// singleTestRun performs one test run and returns metrics or error.
+func singleTestRun(ctx context.Context, config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger *log.Logger) (e2e, ttft time.Duration, throughput float64, tokens int, response string, err error) {
 	// Configure the OpenAI Client
 	clientConfig := openai.DefaultConfig(config.APIKey)
 	clientConfig.BaseURL = config.BaseURL
 	client := openai.NewClientWithConfig(clientConfig)
 
 	// Define the request
-	prompt := "You are a helpful assistant. Please write a short, 150-word story about a curious robot exploring an ancient, overgrown library on a forgotten planet."
+	prompt := "You are a helpful assistant. Please write a short, 150-word story about a curious robot exploring " +
+		"an ancient, overgrown library on a forgotten planet."
 	messages := []openai.ChatCompletionMessage{
 		{
 			Role:    openai.ChatMessageRoleUser,
@@ -90,7 +96,11 @@ func singleTestRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger
 	if streamErr != nil {
 		return 0, 0, 0, 0, "", fmt.Errorf("error creating stream: %w", streamErr)
 	}
-	defer stream.Close()
+	defer func() {
+		if closeErr := stream.Close(); closeErr != nil {
+			providerLogger.Printf("[%s] Warning: Failed to close stream: %v", config.Name, closeErr)
+		}
+	}()
 
 	providerLogger.Printf("[%s] ... Request sent. Waiting for stream ...", config.Name)
 
@@ -103,7 +113,8 @@ func singleTestRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger
 
 		// Check for end of stream
 		if errors.Is(recvErr, io.EOF) {
-			providerLogger.Printf("[%s] ... Stream complete. Received %d chunks (%d content, %d reasoning)", config.Name, chunkCount, nonEmptyChunks, reasoningChunks)
+			providerLogger.Printf("[%s] ... Stream complete. Received %d chunks (%d content, %d reasoning)",
+				config.Name, chunkCount, nonEmptyChunks, reasoningChunks)
 			break
 		}
 
@@ -136,9 +147,11 @@ func singleTestRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger
 		if (content != "" || reasoningContent != "") && firstTokenTime.IsZero() {
 			firstTokenTime = time.Now()
 			if reasoningContent != "" {
-				providerLogger.Printf("[%s] ... First token received (reasoning)! (chunk %d, len=%d)", config.Name, chunkCount, len(reasoningContent))
+				providerLogger.Printf("[%s] ... First token received (reasoning)! (chunk %d, len=%d)",
+					config.Name, chunkCount, len(reasoningContent))
 			} else {
-				providerLogger.Printf("[%s] ... First token received! (chunk %d, len=%d)", config.Name, chunkCount, len(content))
+				providerLogger.Printf("[%s] ... First token received! (chunk %d, len=%d)",
+					config.Name, chunkCount, len(content))
 			}
 		}
 
@@ -164,7 +177,9 @@ func singleTestRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger
 	tokenList := tke.Encode(fullResponse, nil, nil)
 	completionTokens := len(tokenList)
 
-	providerLogger.Printf("[%s] ... Total content length: %d bytes, %d tokens", config.Name, len(fullResponse), completionTokens)
+	providerLogger.Printf(
+		"[%s] ... Total content length: %d bytes, %d tokens",
+		config.Name, len(fullResponse), completionTokens)
 
 	if completionTokens == 0 {
 		return 0, 0, 0, 0, "", fmt.Errorf("received 0 tokens (content length: %d bytes)", len(fullResponse))
@@ -185,8 +200,8 @@ func singleTestRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger
 	return e2eLatency, ttftLatency, throughputVal, completionTokens, fullResponse, nil
 }
 
-// singleToolCallRun performs one tool-calling test run and returns metrics or error
-func singleToolCallRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger *log.Logger, ctx context.Context) (e2e, ttft time.Duration, throughput float64, tokens int, response string, err error) {
+// singleToolCallRun performs one tool-calling test run and returns metrics or error.
+func singleToolCallRun(ctx context.Context, config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger *log.Logger) (e2e, ttft time.Duration, throughput float64, tokens int, response string, err error) {
 	// Configure the OpenAI Client
 	clientConfig := openai.DefaultConfig(config.APIKey)
 	clientConfig.BaseURL = config.BaseURL
@@ -217,7 +232,8 @@ func singleToolCallRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLo
 		},
 	}
 
-	prompt := "What's the weather like in San Francisco, Tokyo, and London? Please check all three cities and tell me which one has the best weather for outdoor activities today."
+	prompt := "What's the weather like in San Francisco, Tokyo, and London? Please check all three cities and " +
+		"tell me which one has the best weather for outdoor activities today."
 	messages := []openai.ChatCompletionMessage{
 		{
 			Role:    openai.ChatMessageRoleUser,
@@ -242,7 +258,11 @@ func singleToolCallRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLo
 	if streamErr != nil {
 		return 0, 0, 0, 0, "", fmt.Errorf("error creating stream: %w", streamErr)
 	}
-	defer stream.Close()
+	defer func() {
+		if closeErr := stream.Close(); closeErr != nil {
+			providerLogger.Printf("[%s] Warning: Failed to close stream: %v", config.Name, closeErr)
+		}
+	}()
 
 	providerLogger.Printf("[%s] ... Tool calling request sent. Waiting for stream ...", config.Name)
 
@@ -256,7 +276,8 @@ func singleToolCallRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLo
 
 		// Check for end of stream
 		if errors.Is(recvErr, io.EOF) {
-			providerLogger.Printf("[%s] ... Tool calling stream complete. Received %d chunks (%d content, %d reasoning, %d tool)",
+			providerLogger.Printf(
+				"[%s] ... Tool calling stream complete. Received %d chunks (%d content, %d reasoning, %d tool)",
 				config.Name, chunkCount, nonEmptyChunks, reasoningChunks, toolCallChunks)
 			break
 		}
@@ -289,11 +310,13 @@ func singleToolCallRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLo
 
 		if (hasContent || hasReasoningContent || hasToolCall) && firstTokenTime.IsZero() {
 			firstTokenTime = time.Now()
-			if hasReasoningContent {
-				providerLogger.Printf("[%s] ... First token received (reasoning, tool-calling)! (chunk %d)", config.Name, chunkCount)
-			} else if hasToolCall {
+			switch {
+			case hasReasoningContent:
+				providerLogger.Printf(
+					"[%s] ... First token received (reasoning, tool-calling)! (chunk %d)", config.Name, chunkCount)
+			case hasToolCall:
 				providerLogger.Printf("[%s] ... First token received (tool-call)! (chunk %d)", config.Name, chunkCount)
-			} else {
+			default:
 				providerLogger.Printf("[%s] ... First token received (tool-calling)! (chunk %d)", config.Name, chunkCount)
 			}
 		}
@@ -335,7 +358,9 @@ func singleToolCallRun(config ProviderConfig, tke *tiktoken.Tiktoken, providerLo
 	tokenList := tke.Encode(fullResponse, nil, nil)
 	completionTokens := len(tokenList)
 
-	providerLogger.Printf("[%s] ... Total content length: %d bytes, %d tokens", config.Name, len(fullResponse), completionTokens)
+	providerLogger.Printf(
+		"[%s] ... Total content length: %d bytes, %d tokens",
+		config.Name, len(fullResponse), completionTokens)
 
 	if completionTokens == 0 {
 		return 0, 0, 0, 0, "", fmt.Errorf("received 0 tokens (content length: %d bytes)", len(fullResponse))
@@ -366,18 +391,23 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 
 	// Create log file for this provider
 	timestamp := time.Now().Format("20060102-150405")
-	logFile, err := os.Create(filepath.Join(logDir, fmt.Sprintf("%s-%s.log", config.Name, timestamp)))
+	logFile, err := os.Create(filepath.Clean(filepath.Join(logDir, fmt.Sprintf("%s-%s.log", config.Name, timestamp))))
 	if err != nil {
 		log.Printf("Error creating log file for %s: %v", config.Name, err)
 		return
 	}
-	defer logFile.Close()
+	defer func() {
+		if closeErr := logFile.Close(); closeErr != nil {
+			log.Printf("Warning: Failed to close log file: %v", closeErr)
+		}
+	}()
 
 	// Create a logger for this provider that writes to both stdout and file
 	providerLogger := log.New(io.MultiWriter(os.Stdout, logFile), "", log.LstdFlags)
 
 	modeStr := string(mode)
-	providerLogger.Printf("--- Testing: %s (%s) - Mode: %s - Running 3 concurrent iterations ---", config.Name, config.Model, modeStr)
+	providerLogger.Printf("--- Testing: %s (%s) - Mode: %s - Running 3 concurrent iterations ---",
+		config.Name, config.Model, modeStr)
 
 	// Create 5-minute timeout context for all runs (reasoning models can be slow)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -412,7 +442,7 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 	for _, testMode := range modesToRun {
 		for i := 1; i <= iterationsPerMode; i++ {
 			runWg.Add(1)
-			go func(currentRunNum int, currentMode TestMode, iteration int) {
+			go func(currentRunNum int, currentMode TestMode) {
 				defer runWg.Done()
 				providerLogger.Printf("[%s] Run %d/%d (%s) starting", config.Name, currentRunNum, totalRuns, currentMode)
 
@@ -424,16 +454,18 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 
 				// Execute the appropriate test based on mode
 				if currentMode == ModeToolCalling {
-					e2e, ttft, throughput, tokens, responseContent, runErr = singleToolCallRun(config, tke, providerLogger, ctx)
+					e2e, ttft, throughput, tokens, responseContent, runErr = singleToolCallRun(ctx, config, tke, providerLogger)
 				} else {
-					e2e, ttft, throughput, tokens, responseContent, runErr = singleTestRun(config, tke, providerLogger, ctx)
+					e2e, ttft, throughput, tokens, responseContent, runErr = singleTestRun(ctx, config, tke, providerLogger)
 				}
 
 				// Save response if flag is enabled
 				if saveResponses && runErr == nil && responseContent != "" {
-					responseFile := filepath.Join(logDir, fmt.Sprintf("%s-run%d-%s-response.txt", config.Name, currentRunNum, currentMode))
-					if err := os.WriteFile(responseFile, []byte(responseContent), 0644); err != nil {
-						providerLogger.Printf("[%s] Warning: Failed to save response for run %d: %v", config.Name, currentRunNum, err)
+					responseFile := filepath.Clean(filepath.Join(logDir,
+						fmt.Sprintf("%s-run%d-%s-response.txt", config.Name, currentRunNum, currentMode)))
+					if err := os.WriteFile(responseFile, []byte(responseContent), 0600); err != nil {
+						providerLogger.Printf("[%s] Warning: Failed to save response for run %d: %v",
+							config.Name, currentRunNum, err)
 					}
 				}
 
@@ -453,7 +485,7 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 					runNum:     currentRunNum,
 					mode:       currentMode,
 				}
-			}(runNum, testMode, i)
+			}(runNum, testMode)
 			runNum++
 		}
 	}
@@ -533,7 +565,7 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 	appendResult(results, resultsMutex, result)
 }
 
-// appendResult safely appends a result to the shared results slice
+// appendResult safely appends a result to the shared results slice.
 func appendResult(results *[]TestResult, mutex *sync.Mutex, result TestResult) {
 	if results != nil && mutex != nil {
 		mutex.Lock()
@@ -542,7 +574,7 @@ func appendResult(results *[]TestResult, mutex *sync.Mutex, result TestResult) {
 	}
 }
 
-// saveResult saves the test result to a JSON file
+// saveResult saves the test result to a JSON file.
 func saveResult(resultsDir string, result TestResult) {
 	timestamp := result.Timestamp.Format("20060102-150405")
 	filename := filepath.Join(resultsDir, fmt.Sprintf("%s-%s.json", result.Provider, timestamp))
@@ -553,7 +585,7 @@ func saveResult(resultsDir string, result TestResult) {
 		return
 	}
 
-	if err := os.WriteFile(filename, data, 0644); err != nil {
+	if err := os.WriteFile(filename, data, 0600); err != nil {
 		log.Printf("Error writing result file for %s: %v", result.Provider, err)
 		return
 	}
@@ -561,7 +593,7 @@ func saveResult(resultsDir string, result TestResult) {
 	log.Printf("Result saved: %s", filename)
 }
 
-// generateMarkdownReport creates a summary report of all test results
+// generateMarkdownReport creates a summary report of all test results.
 func generateMarkdownReport(resultsDir string, results []TestResult, sessionTimestamp string) error {
 	filename := filepath.Join(resultsDir, "REPORT.md")
 
@@ -712,45 +744,50 @@ func generateMarkdownReport(resultsDir string, results []TestResult, sessionTime
 	report.WriteString("---\n\n")
 	report.WriteString(fmt.Sprintf("*Report generated at %s*\n", time.Now().Format("2006-01-02 15:04:05")))
 
-	if err := os.WriteFile(filename, []byte(report.String()), 0644); err != nil {
-		return fmt.Errorf("error writing report: %v", err)
+	if err := os.WriteFile(filename, []byte(report.String()), 0600); err != nil {
+		return fmt.Errorf("error writing report: %w", err)
 	}
 
 	log.Printf("Report generated: %s", filename)
 	return nil
 }
 
-// DiagnosticSummary holds the aggregated results from a diagnostic run
+// DiagnosticSummary holds the aggregated results from a diagnostic run.
 type DiagnosticSummary struct {
 	Provider      string         `json:"provider"`
 	Model         string         `json:"model"`
 	Mode          string         `json:"mode"`
 	Timestamp     time.Time      `json:"timestamp"`
-	TotalRequests int            `json:"total_requests"`
+	TotalRequests int            `json:"totalRequests"`
 	Successful    int            `json:"successful"`
 	Failed        int            `json:"failed"`
-	AvgE2ELatency time.Duration  `json:"avg_e2e_latency"`
-	AvgTTFT       time.Duration  `json:"avg_ttft"`
-	AvgThroughput float64        `json:"avg_throughput"`
-	AvgTokens     int            `json:"avg_tokens"`
+	AvgE2ELatency time.Duration  `json:"avgE2eLatency"`
+	AvgTTFT       time.Duration  `json:"avgTtft"`
+	AvgThroughput float64        `json:"avgThroughput"`
+	AvgTokens     int            `json:"avgTokens"`
 	Errors        map[string]int `json:"errors,omitempty"`
 }
 
-// diagnosticMode runs continuous testing with 10 workers for 1 minute
-// Makes requests every 15 seconds, with 30-second timeout per request
-// Workers stop starting new requests when insufficient time remains (5s grace period)
-// Expected: ~3 requests per worker (at 0s, 15s, 30s) for a total of ~30 requests
+// diagnosticMode runs continuous testing with 10 workers for 1 minute.
+// Makes requests every 15 seconds, with 30-second timeout per request.
+// Workers stop starting new requests when insufficient time remains (5s grace period).
+// Expected: ~3 requests per worker (at 0s, 15s, 30s) for a total of ~30 requests.
 func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resultsDir string, mode TestMode, wg *sync.WaitGroup, results *[]DiagnosticSummary, resultsMutex *sync.Mutex) {
 	if wg != nil {
 		defer wg.Done()
 	}
 	timestamp := time.Now().Format("20060102-150405")
-	logFile, err := os.Create(filepath.Join(logDir, fmt.Sprintf("%s-diagnostic-%s.log", config.Name, timestamp)))
+	logFileName := filepath.Clean(filepath.Join(logDir, fmt.Sprintf("%s-diagnostic-%s.log", config.Name, timestamp)))
+	logFile, err := os.Create(logFileName)
 	if err != nil {
 		log.Printf("Error creating diagnostic log file for %s: %v", config.Name, err)
 		return
 	}
-	defer logFile.Close()
+	defer func() {
+		if closeErr := logFile.Close(); closeErr != nil {
+			log.Printf("Warning: Failed to close log file: %v", closeErr)
+		}
+	}()
 
 	providerLogger := log.New(io.MultiWriter(os.Stdout, logFile), "", log.LstdFlags)
 	providerLogger.Printf("=== DIAGNOSTIC MODE: %s (%s) - Mode: %s ===", config.Name, config.Model, mode)
@@ -817,26 +854,31 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 					// Alternate between streaming and tool-calling in mixed mode
 					if reqNum%2 == 1 {
 						testMode = ModeStreaming
-						e2e, ttft, throughput, tokens, responseContent, reqErr = singleTestRun(config, tke, providerLogger, reqCtx)
+						e2e, ttft, throughput, tokens, responseContent, reqErr = singleTestRun(reqCtx, config, tke, providerLogger)
 					} else {
 						testMode = ModeToolCalling
-						e2e, ttft, throughput, tokens, responseContent, reqErr = singleToolCallRun(config, tke, providerLogger, reqCtx)
+						e2e, ttft, throughput, tokens, responseContent, reqErr = singleToolCallRun(reqCtx, config, tke, providerLogger)
 					}
 				case ModeToolCalling:
 					testMode = ModeToolCalling
-					e2e, ttft, throughput, tokens, responseContent, reqErr = singleToolCallRun(config, tke, providerLogger, reqCtx)
+					e2e, ttft, throughput, tokens, responseContent, reqErr = singleToolCallRun(reqCtx, config, tke, providerLogger)
+				case ModeStreaming:
+					testMode = ModeStreaming
+					e2e, ttft, throughput, tokens, responseContent, reqErr = singleTestRun(reqCtx, config, tke, providerLogger)
 				default:
 					testMode = ModeStreaming
-					e2e, ttft, throughput, tokens, responseContent, reqErr = singleTestRun(config, tke, providerLogger, reqCtx)
+					e2e, ttft, throughput, tokens, responseContent, reqErr = singleTestRun(reqCtx, config, tke, providerLogger)
 				}
 
 				reqCancel()
 
 				// Save response if flag is enabled
 				if saveResponses && reqErr == nil && responseContent != "" {
-					responseFile := filepath.Join(logDir, fmt.Sprintf("%s-worker%d-req%d-%s-response.txt", config.Name, id, reqNum, testMode))
-					if err := os.WriteFile(responseFile, []byte(responseContent), 0644); err != nil {
-						providerLogger.Printf("[Worker %d] Warning: Failed to save response for request #%d: %v", id, reqNum, err)
+					responseFile := filepath.Clean(filepath.Join(logDir,
+						fmt.Sprintf("%s-worker%d-req%d-%s-response.txt", config.Name, id, reqNum, testMode)))
+					if err := os.WriteFile(responseFile, []byte(responseContent), 0600); err != nil {
+						providerLogger.Printf("[Worker %d] Warning: Failed to save response for request #%d: %v",
+							id, reqNum, err)
 					}
 				}
 
@@ -871,7 +913,8 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 
 					// Skip new requests if insufficient time remains
 					if timeRemaining < requestTimeout+gracePeriod {
-						providerLogger.Printf("[Worker %d] Stopping - insufficient time remaining for next request (%.1fs left, need %.1fs)",
+						providerLogger.Printf(
+							"[Worker %d] Stopping - insufficient time remaining for next request (%.1fs left, need %.1fs)",
 							id, timeRemaining.Seconds(), (requestTimeout + gracePeriod).Seconds())
 						providerLogger.Printf("[Worker %d] Completed %d requests", id, reqNum)
 						return
@@ -967,9 +1010,16 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 
 	// Save diagnostic summary to JSON
 	summaryFile := filepath.Join(resultsDir, fmt.Sprintf("%s-diagnostic-summary-%s.json", config.Name, timestamp))
-	data, _ := json.MarshalIndent(summary, "", "  ")
-	os.WriteFile(summaryFile, data, 0644)
-	providerLogger.Printf("Diagnostic summary saved: %s", summaryFile)
+	data, err := json.MarshalIndent(summary, "", "  ")
+	if err != nil {
+		providerLogger.Printf("Warning: Failed to marshal diagnostic summary: %v", err)
+	} else {
+		if err := os.WriteFile(summaryFile, data, 0600); err != nil {
+			providerLogger.Printf("Warning: Failed to write diagnostic summary: %v", err)
+		} else {
+			providerLogger.Printf("Diagnostic summary saved: %s", summaryFile)
+		}
+	}
 
 	// Append to results slice if provided
 	if results != nil && resultsMutex != nil {
@@ -979,7 +1029,7 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 	}
 }
 
-// generateDiagnosticReport creates a markdown report for diagnostic mode results
+// generateDiagnosticReport creates a markdown report for diagnostic mode results.
 func generateDiagnosticReport(resultsDir string, results []DiagnosticSummary, sessionTimestamp string) error {
 	filename := filepath.Join(resultsDir, "DIAGNOSTIC-REPORT.md")
 
@@ -1004,21 +1054,25 @@ func generateDiagnosticReport(resultsDir string, results []DiagnosticSummary, se
 	report.WriteString("## Summary\n\n")
 	report.WriteString(fmt.Sprintf("- **Providers Tested:** %d\n", totalProviders))
 	report.WriteString(fmt.Sprintf("- **Total Requests:** %d\n", totalRequests))
-	report.WriteString(fmt.Sprintf("- **Successful:** %d (%.1f%%)\n", totalSuccessful, 100.0*float64(totalSuccessful)/float64(totalRequests)))
-	report.WriteString(fmt.Sprintf("- **Failed:** %d (%.1f%%)\n\n", totalFailed, 100.0*float64(totalFailed)/float64(totalRequests)))
+	report.WriteString(fmt.Sprintf("- **Successful:** %d (%.1f%%)\n",
+		totalSuccessful, 100.0*float64(totalSuccessful)/float64(totalRequests)))
+	report.WriteString(fmt.Sprintf("- **Failed:** %d (%.1f%%)\n\n",
+		totalFailed, 100.0*float64(totalFailed)/float64(totalRequests)))
 
 	// Detailed results table
 	if len(results) > 0 {
 		report.WriteString("## Detailed Results\n\n")
-		report.WriteString("| Provider | Model | Mode | Total Requests | Success | Failed | Avg E2E | Avg TTFT | Avg Throughput |\n")
-		report.WriteString("|----------|-------|------|----------------|---------|--------|---------|----------|----------------|\n")
+		report.WriteString("| Provider | Model | Mode | Total Requests | Success | Failed | Avg E2E |" +
+			" Avg TTFT | Avg Throughput |\n")
+		report.WriteString("|----------|-------|------|----------------|---------|--------|---------|" +
+			"----------|----------------|\n")
 
 		for _, r := range results {
 			successRate := fmt.Sprintf("%d/%d", r.Successful, r.TotalRequests)
 			failRate := fmt.Sprintf("%d", r.Failed)
-			avgE2E := "N/A"
-			avgTTFT := "N/A"
-			avgThroughput := "N/A"
+			avgE2E := NotAvailable
+			avgTTFT := NotAvailable
+			avgThroughput := NotAvailable
 
 			if r.Successful > 0 {
 				avgE2E = formatDuration(r.AvgE2ELatency)
@@ -1132,8 +1186,8 @@ func generateDiagnosticReport(resultsDir string, results []DiagnosticSummary, se
 	report.WriteString("---\n\n")
 	report.WriteString(fmt.Sprintf("*Report generated at %s*\n", time.Now().Format("2006-01-02 15:04:05")))
 
-	if err := os.WriteFile(filename, []byte(report.String()), 0644); err != nil {
-		return fmt.Errorf("error writing diagnostic report: %v", err)
+	if err := os.WriteFile(filename, []byte(report.String()), 0600); err != nil {
+		return fmt.Errorf("error writing diagnostic report: %w", err)
 	}
 
 	log.Printf("Diagnostic report generated: %s", filename)
@@ -1157,13 +1211,17 @@ func main() {
 	}
 
 	// 2. Parse Command-Line Flags
-	providerName := flag.String("provider", "", "Specific provider to test (e.g., nim, novita). If empty, tests 'generic' provider.")
+	providerName := flag.String("provider", "",
+		"Specific provider to test (e.g., nim, novita). If empty, tests 'generic' provider.")
 	testAll := flag.Bool("all", false, "Test all configured providers concurrently.")
-	flagGenericURL := flag.String("url", "", "Override Base URL for 'generic' provider (default: https://openrouter.ai/api/v1)")
-	flagGenericModel := flag.String("model", "", "Model name for 'generic' provider (required if --provider is not set)")
+	flagGenericURL := flag.String("url", "",
+		"Override Base URL for 'generic' provider (default: https://openrouter.ai/api/v1)")
+	flagGenericModel := flag.String("model", "",
+		"Model name for 'generic' provider (required if --provider is not set)")
 	toolCalling := flag.Bool("tool-calling", false, "Use tool calling mode instead of regular streaming")
 	mixed := flag.Bool("mixed", false, "Run both streaming and tool-calling modes (3 runs each)")
-	diagnostic := flag.Bool("diagnostic", false, "Run diagnostic mode: 10 workers making requests every 15s for 1 minute with 30s timeout")
+	diagnostic := flag.Bool("diagnostic", false,
+		"Run diagnostic mode: 10 workers making requests every 15s for 1 minute with 30s timeout")
 	flagSaveResponses := flag.Bool("save-responses", false, "Save all API responses to log files")
 	flag.Parse()
 
@@ -1176,11 +1234,11 @@ func main() {
 	logDir := filepath.Join(sessionDir, "logs")
 	resultsDir := sessionDir
 
-	if err := os.MkdirAll(logDir, 0755); err != nil {
+	if err := os.MkdirAll(logDir, 0750); err != nil {
 		log.Fatalf("Error creating logs directory: %v", err)
 	}
 
-	if err := os.MkdirAll(resultsDir, 0755); err != nil {
+	if err := os.MkdirAll(resultsDir, 0750); err != nil {
 		log.Fatalf("Error creating results directory: %v", err)
 	}
 
@@ -1252,35 +1310,35 @@ func main() {
 	// 5. Select Providers to Test based on flags
 	providersToTest := []ProviderConfig{}
 
-	if *testAll {
+	switch {
+	case *testAll:
 		log.Println("--- Testing all configured providers... ---")
 		for name, config := range allProviderConfigs {
 			if config.APIKey != "" && config.Model != "" {
 				providersToTest = append(providersToTest, config)
-			} else {
+			} else if name != "generic" {
 				// Don't log generic provider if not set, it's optional
-				if name != "generic" {
-					log.Printf("... Skipping '%s': APIKey or Model not configured in .env\n", name)
-				}
+				log.Printf("... Skipping '%s': APIKey or Model not configured in .env\n", name)
 			}
 		}
 		// Check generic provider separately for --all
 		genConfig := allProviderConfigs["generic"]
 		if genConfig.APIKey != "" && genConfig.Model != "" {
-			log.Println("... 'generic' provider is configured, but will be skipped. Use --provider=generic or no flags to test it.")
+			log.Println("... 'generic' provider is configured, but will be skipped. " +
+				"Use --provider=generic or no flags to test it.")
 		}
-
-	} else if *providerName != "" {
+	case *providerName != "":
 		log.Printf("--- Testing single provider: '%s' ---\n", *providerName)
 		config, ok := allProviderConfigs[*providerName]
 		if !ok {
 			log.Fatalf("Error: Provider '%s' not recognized.", *providerName)
 		}
 		if config.APIKey == "" || config.Model == "" {
-			log.Fatalf("Error: Provider '%s' is not configured. (Missing APIKey/Model in .env or --model flag for generic)", *providerName)
+			log.Fatalf("Error: Provider '%s' is not configured. "+
+				"(Missing APIKey/Model in .env or --model flag for generic)", *providerName)
 		}
 		providersToTest = append(providersToTest, config)
-	} else {
+	default:
 		// Default: test "generic" provider
 		log.Println("--- Testing default 'generic' provider... ---")
 		config := allProviderConfigs["generic"]
@@ -1299,13 +1357,14 @@ func main() {
 
 	// Determine test mode
 	var testMode TestMode
-	if *mixed {
+	switch {
+	case *mixed:
 		testMode = ModeMixed
 		log.Println("Test mode: Mixed (streaming + tool-calling)")
-	} else if *toolCalling {
+	case *toolCalling:
 		testMode = ModeToolCalling
-		log.Println("Test mode: Tool-calling")
-	} else {
+		log.Println("Test mode: Tool-calling)")
+	default:
 		testMode = ModeStreaming
 		log.Println("Test mode: Streaming")
 	}
