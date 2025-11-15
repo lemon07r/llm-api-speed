@@ -57,6 +57,50 @@ const (
 	NotAvailable = "N/A"
 )
 
+func logInterleavedToolError(providerLogger *log.Logger, config ProviderConfig, streamErr error) {
+	var apiErr *openai.APIError
+	if errors.As(streamErr, &apiErr) {
+		param := ""
+		if apiErr.Param != nil {
+			param = *apiErr.Param
+		}
+		message := apiErr.Message
+		lowerMsg := strings.ToLower(message)
+		if param == "parallel_tool_calls" || strings.Contains(lowerMsg, "parallel_tool_calls") {
+			providerLogger.Printf("[%s] Interleaved tool calls NOT supported by model %s (error: %s)", config.Name, config.Model, message)
+			return
+		}
+		providerLogger.Printf("[%s] Interleaved tool-call request rejected by API: %s", config.Name, message)
+		return
+	}
+	providerLogger.Printf("[%s] Interleaved tool-call request failed before streaming: %v", config.Name, streamErr)
+}
+
+// resolveTestMode determines which TestMode should run based on CLI flags and whether
+// interleaved tool-call testing should remain enabled. It returns the selected mode,
+// the effective interleaved flag (disabled automatically for pure streaming tests),
+// and whether tool-calling mode was implicitly forced by requesting interleaved tests.
+func resolveTestMode(toolCalling, mixed, interleaved bool) (TestMode, bool, bool) {
+	forcedToolCalling := false
+	mode := ModeStreaming
+
+	switch {
+	case mixed:
+		mode = ModeMixed
+	case toolCalling:
+		mode = ModeToolCalling
+	case interleaved:
+		mode = ModeToolCalling
+		forcedToolCalling = true
+	}
+
+	if mode == ModeStreaming {
+		interleaved = false
+	}
+
+	return mode, interleaved, forcedToolCalling
+}
+
 // formatDuration formats a duration as decimal seconds.
 func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%.3fs", d.Seconds())
@@ -389,7 +433,7 @@ func singleTestRun(ctx context.Context, config ProviderConfig, tke *tiktoken.Tik
 }
 
 // singleToolCallRun performs one tool-calling test run and returns metrics or error.
-func singleToolCallRun(ctx context.Context, config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger *log.Logger) (e2e, ttft time.Duration, throughput float64, tokens int, response string, err error) {
+func singleToolCallRun(ctx context.Context, config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger *log.Logger, interleavedTools bool) (e2e, ttft time.Duration, throughput float64, tokens int, response string, err error) {
 	// Configure the OpenAI Client
 	clientConfig := openai.DefaultConfig(config.APIKey)
 	clientConfig.BaseURL = config.BaseURL
@@ -437,6 +481,11 @@ func singleToolCallRun(ctx context.Context, config ProviderConfig, tke *tiktoken
 		Stream:    true,
 	}
 
+	if interleavedTools {
+		req.ParallelToolCalls = true
+		req.ToolChoice = "auto"
+	}
+
 	// Execute the stream and measure metrics
 	startTime := time.Now()
 	var firstTokenTime time.Time
@@ -444,6 +493,9 @@ func singleToolCallRun(ctx context.Context, config ProviderConfig, tke *tiktoken
 
 	stream, streamErr := client.CreateChatCompletionStream(ctx, req)
 	if streamErr != nil {
+		if interleavedTools {
+			logInterleavedToolError(providerLogger, config, streamErr)
+		}
 		return 0, 0, 0, 0, "", fmt.Errorf("error creating stream: %w", streamErr)
 	}
 	defer func() {
@@ -458,6 +510,9 @@ func singleToolCallRun(ctx context.Context, config ProviderConfig, tke *tiktoken
 	nonEmptyChunks := 0
 	reasoningChunks := 0
 	toolCallChunks := 0
+	streamReportedToolCalls := false
+	streamInterleavedContent := false
+	streamInterleavedReasoning := false
 
 	for {
 		response, recvErr := stream.Recv()
@@ -524,6 +579,13 @@ func singleToolCallRun(ctx context.Context, config ProviderConfig, tke *tiktoken
 		// Append tool call information as text for token counting
 		if hasToolCall {
 			toolCallChunks++
+			streamReportedToolCalls = true
+			if hasContent {
+				streamInterleavedContent = true
+			}
+			if hasReasoningContent {
+				streamInterleavedReasoning = true
+			}
 			for _, toolCall := range delta.ToolCalls {
 				if toolCall.Function.Name != "" {
 					fullResponseContent.WriteString(toolCall.Function.Name)
@@ -536,6 +598,10 @@ func singleToolCallRun(ctx context.Context, config ProviderConfig, tke *tiktoken
 	}
 
 	endTime := time.Now()
+
+	if interleavedTools {
+		providerLogger.Printf("[%s] Interleaved tool-call summary: toolCallsObserved=%t interleavedContent=%t interleavedReasoning=%t", config.Name, streamReportedToolCalls, streamInterleavedContent, streamInterleavedReasoning)
+	}
 
 	if firstTokenTime.IsZero() {
 		return 0, 0, 0, 0, "", fmt.Errorf("no content received from API (received %d chunks)", chunkCount)
@@ -571,7 +637,7 @@ func singleToolCallRun(ctx context.Context, config ProviderConfig, tke *tiktoken
 
 // testProviderMetrics runs a full benchmark test against a single provider.
 // It runs 3 iterations and reports averaged results, with a 2-minute total timeout.
-func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync.WaitGroup, logDir, resultsDir string, results *[]TestResult, resultsMutex *sync.Mutex, mode TestMode) {
+func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync.WaitGroup, logDir, resultsDir string, results *[]TestResult, resultsMutex *sync.Mutex, mode TestMode, interleavedTools bool) {
 	// Defer wg.Done() if this is part of a concurrent group
 	if wg != nil {
 		defer wg.Done()
@@ -639,10 +705,11 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 				var tokens int
 				var runErr error
 				var responseContent string
+				useInterleaved := interleavedTools && currentMode == ModeToolCalling
 
 				// Execute the appropriate test based on mode
 				if currentMode == ModeToolCalling {
-					e2e, ttft, throughput, tokens, responseContent, runErr = singleToolCallRun(ctx, config, tke, providerLogger)
+					e2e, ttft, throughput, tokens, responseContent, runErr = singleToolCallRun(ctx, config, tke, providerLogger, useInterleaved)
 				} else {
 					e2e, ttft, throughput, tokens, responseContent, runErr = singleTestRun(ctx, config, tke, providerLogger)
 				}
@@ -888,7 +955,7 @@ type DiagnosticSummary struct {
 // Makes requests every 15 seconds, with 30-second timeout per request.
 // Workers stop starting new requests when insufficient time remains (5s grace period).
 // Expected: 4 requests per worker (at 0s, 15s, 30s, 45s) for a total of 40 requests.
-func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resultsDir string, mode TestMode, wg *sync.WaitGroup, results *[]DiagnosticSummary, resultsMutex *sync.Mutex) {
+func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resultsDir string, mode TestMode, interleavedTools bool, wg *sync.WaitGroup, results *[]DiagnosticSummary, resultsMutex *sync.Mutex) {
 	if wg != nil {
 		defer wg.Done()
 	}
@@ -973,11 +1040,11 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 						e2e, ttft, throughput, tokens, responseContent, reqErr = singleTestRun(reqCtx, config, tke, providerLogger)
 					} else {
 						testMode = ModeToolCalling
-						e2e, ttft, throughput, tokens, responseContent, reqErr = singleToolCallRun(reqCtx, config, tke, providerLogger)
+						e2e, ttft, throughput, tokens, responseContent, reqErr = singleToolCallRun(reqCtx, config, tke, providerLogger, interleavedTools)
 					}
 				case ModeToolCalling:
 					testMode = ModeToolCalling
-					e2e, ttft, throughput, tokens, responseContent, reqErr = singleToolCallRun(reqCtx, config, tke, providerLogger)
+					e2e, ttft, throughput, tokens, responseContent, reqErr = singleToolCallRun(reqCtx, config, tke, providerLogger, interleavedTools)
 				case ModeStreaming:
 					testMode = ModeStreaming
 					e2e, ttft, throughput, tokens, responseContent, reqErr = singleTestRun(reqCtx, config, tke, providerLogger)
@@ -1342,6 +1409,8 @@ func main() {
 	mixed := flag.Bool("mixed", false, "Run both streaming and tool-calling modes (3 runs each)")
 	diagnostic := flag.Bool("diagnostic", false,
 		"Run diagnostic mode: 10 workers making requests every 15s for 1 minute with 30s timeout")
+	flagInterleavedTools := flag.Bool("interleaved-tools", false,
+		"Enable parallel/interleaved tool-call mode and report support (implies tool-calling)")
 	flagSaveResponses := flag.Bool("save-responses", false, "Save all API responses to log files")
 	flagTargetTokens := flag.Int("target-tokens", 350,
 		"Target token count for projected E2E latency normalization (default: 350)")
@@ -1478,18 +1547,26 @@ func main() {
 		log.Fatal("No providers configured or selected to test.")
 	}
 
-	// Determine test mode
-	var testMode TestMode
-	switch {
-	case *mixed:
-		testMode = ModeMixed
+	// Determine test mode and interleaved behaviour
+	rawInterleaved := *flagInterleavedTools
+	testMode, interleavedTools, forcedToolMode := resolveTestMode(*toolCalling, *mixed, rawInterleaved)
+	switch testMode {
+	case ModeMixed:
 		log.Println("Test mode: Mixed (streaming + tool-calling)")
-	case *toolCalling:
-		testMode = ModeToolCalling
-		log.Println("Test mode: Tool-calling)")
-	default:
-		testMode = ModeStreaming
+	case ModeToolCalling:
+		log.Println("Test mode: Tool-calling")
+	case ModeStreaming:
 		log.Println("Test mode: Streaming")
+	default:
+		log.Printf("Test mode: %s", testMode)
+	}
+	if forcedToolMode {
+		log.Println("Interleaved tool-call testing enabled; defaulting to tool-calling mode.")
+	} else if rawInterleaved && !interleavedTools {
+		log.Println("Warning: --interleaved-tools ignored because streaming-only mode selected.")
+	}
+	if interleavedTools {
+		log.Println("Interleaved tool-call testing is ENABLED for tool-calling runs.")
 	}
 
 	// 6. Run Tests
@@ -1505,13 +1582,13 @@ func main() {
 			var diagnosticWg sync.WaitGroup
 			for _, provider := range providersToTest {
 				diagnosticWg.Add(1)
-				go diagnosticMode(provider, tke, logDir, resultsDir, testMode, &diagnosticWg, &diagnosticResults, &diagnosticMutex)
+				go diagnosticMode(provider, tke, logDir, resultsDir, testMode, interleavedTools, &diagnosticWg, &diagnosticResults, &diagnosticMutex)
 			}
 			diagnosticWg.Wait()
 		} else {
 			// Single provider (no concurrency needed)
 			for _, provider := range providersToTest {
-				diagnosticMode(provider, tke, logDir, resultsDir, testMode, nil, &diagnosticResults, &diagnosticMutex)
+				diagnosticMode(provider, tke, logDir, resultsDir, testMode, interleavedTools, nil, &diagnosticResults, &diagnosticMutex)
 			}
 		}
 
@@ -1534,10 +1611,10 @@ func main() {
 		if *testAll {
 			// Run all tests concurrently
 			wg.Add(1)
-			go testProviderMetrics(provider, tke, &wg, logDir, resultsDir, &results, &resultsMutex, testMode)
+			go testProviderMetrics(provider, tke, &wg, logDir, resultsDir, &results, &resultsMutex, testMode, interleavedTools)
 		} else {
 			// Run a single test sequentially
-			testProviderMetrics(provider, tke, nil, logDir, resultsDir, &results, &resultsMutex, testMode)
+			testProviderMetrics(provider, tke, nil, logDir, resultsDir, &results, &resultsMutex, testMode, interleavedTools)
 		}
 	}
 

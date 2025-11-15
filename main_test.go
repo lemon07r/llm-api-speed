@@ -90,3 +90,69 @@ func TestProviderConfigCreation(t *testing.T) {
 		})
 	}
 }
+
+func TestResolveTestMode(t *testing.T) {
+	tests := []struct {
+		name            string
+		toolCalling     bool
+		mixed           bool
+		interleavedFlag bool
+		wantMode        TestMode
+		wantInterleaved bool
+		wantForcedTool  bool
+	}{
+		{
+			name:            "default streaming",
+			wantMode:        ModeStreaming,
+			wantInterleaved: false,
+		},
+		{
+			name:            "explicit tool-calling",
+			toolCalling:     true,
+			wantMode:        ModeToolCalling,
+			wantInterleaved: false,
+		},
+		{
+			name:            "interleaved implies tool-calling",
+			interleavedFlag: true,
+			wantMode:        ModeToolCalling,
+			wantInterleaved: true,
+			wantForcedTool:  true,
+		},
+		{
+			name:            "mixed keeps interleaved",
+			mixed:           true,
+			interleavedFlag: true,
+			wantMode:        ModeMixed,
+			wantInterleaved: true,
+		},
+		{
+			name:            "tool-calling with interleaved",
+			toolCalling:     true,
+			interleavedFlag: true,
+			wantMode:        ModeToolCalling,
+			wantInterleaved: true,
+		},
+		{
+			name:            "mixed without interleaved",
+			mixed:           true,
+			wantMode:        ModeMixed,
+			wantInterleaved: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mode, interleaved, forced := resolveTestMode(tt.toolCalling, tt.mixed, tt.interleavedFlag)
+			if mode != tt.wantMode {
+				t.Fatalf("expected mode %s, got %s", tt.wantMode, mode)
+			}
+			if interleaved != tt.wantInterleaved {
+				t.Fatalf("expected interleaved=%t, got %t", tt.wantInterleaved, interleaved)
+			}
+			if forced != tt.wantForcedTool {
+				t.Fatalf("expected forced=%t, got %t", tt.wantForcedTool, forced)
+			}
+		})
+	}
+}

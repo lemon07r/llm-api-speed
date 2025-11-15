@@ -103,6 +103,20 @@ Tests the API's tool/function calling capabilities with streaming. Measures perf
 ./llm-api-speed --provider nim --tool-calling
 ```
 
+You can also enable **interleaved/parallel tool-call testing** via:
+
+```bash
+# Enable interleaved tool-call testing (implies tool-calling mode if not otherwise set)
+./llm-api-speed --provider nim --tool-calling --interleaved-tools
+
+# With an OpenAI-compatible endpoint (e.g., a reasoning/thinking model)
+./llm-api-speed --url https://api.openai.com/v1 \
+  --model gpt-4.1-mini \
+  --tool-calling --interleaved-tools
+```
+
+When `--interleaved-tools` is set, the tool sends `parallel_tool_calls=true` and logs whether tool calls appeared mixed with normal content and/or reasoning content in the streamed response, so you can see if a model truly supports interleaved tool calls.
+
 #### Mixed Mode
 Runs 3 iterations of both streaming and tool-calling modes (6 total runs). Provides comprehensive performance metrics for both use cases.
 
