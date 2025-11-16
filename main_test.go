@@ -93,62 +93,62 @@ func TestProviderConfigCreation(t *testing.T) {
 
 func TestResolveTestMode(t *testing.T) {
 	tests := []struct {
-		name            string
-		toolCalling     bool
-		mixed           bool
-		interleavedFlag bool
-		wantMode        TestMode
-		wantInterleaved bool
-		wantForcedTool  bool
+		name           string
+		toolCalling    bool
+		mixed          bool
+		reasoningFlag  bool
+		wantMode       TestMode
+		wantReasoning  bool
+		wantForcedTool bool
 	}{
 		{
-			name:            "default streaming",
-			wantMode:        ModeStreaming,
-			wantInterleaved: false,
+			name:          "default streaming",
+			wantMode:      ModeStreaming,
+			wantReasoning: false,
 		},
 		{
-			name:            "explicit tool-calling",
-			toolCalling:     true,
-			wantMode:        ModeToolCalling,
-			wantInterleaved: false,
+			name:          "explicit tool-calling",
+			toolCalling:   true,
+			wantMode:      ModeToolCalling,
+			wantReasoning: false,
 		},
 		{
-			name:            "interleaved implies tool-calling",
-			interleavedFlag: true,
-			wantMode:        ModeToolCalling,
-			wantInterleaved: true,
-			wantForcedTool:  true,
+			name:           "reasoning check implies tool-calling",
+			reasoningFlag:  true,
+			wantMode:       ModeToolCalling,
+			wantReasoning:  true,
+			wantForcedTool: true,
 		},
 		{
-			name:            "mixed keeps interleaved",
-			mixed:           true,
-			interleavedFlag: true,
-			wantMode:        ModeMixed,
-			wantInterleaved: true,
+			name:          "mixed keeps reasoning check",
+			mixed:         true,
+			reasoningFlag: true,
+			wantMode:      ModeMixed,
+			wantReasoning: true,
 		},
 		{
-			name:            "tool-calling with interleaved",
-			toolCalling:     true,
-			interleavedFlag: true,
-			wantMode:        ModeToolCalling,
-			wantInterleaved: true,
+			name:          "tool-calling with reasoning check",
+			toolCalling:   true,
+			reasoningFlag: true,
+			wantMode:      ModeToolCalling,
+			wantReasoning: true,
 		},
 		{
-			name:            "mixed without interleaved",
-			mixed:           true,
-			wantMode:        ModeMixed,
-			wantInterleaved: false,
+			name:          "mixed without interleaved",
+			mixed:         true,
+			wantMode:      ModeMixed,
+			wantReasoning: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mode, interleaved, forced := resolveTestMode(tt.toolCalling, tt.mixed, tt.interleavedFlag)
+			mode, reasoning, forced := resolveTestMode(tt.toolCalling, tt.mixed, tt.reasoningFlag)
 			if mode != tt.wantMode {
 				t.Fatalf("expected mode %s, got %s", tt.wantMode, mode)
 			}
-			if interleaved != tt.wantInterleaved {
-				t.Fatalf("expected interleaved=%t, got %t", tt.wantInterleaved, interleaved)
+			if reasoning != tt.wantReasoning {
+				t.Fatalf("expected reasoning=%t, got %t", tt.wantReasoning, reasoning)
 			}
 			if forced != tt.wantForcedTool {
 				t.Fatalf("expected forced=%t, got %t", tt.wantForcedTool, forced)
