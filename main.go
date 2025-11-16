@@ -640,9 +640,9 @@ func singleToolCallRun(ctx context.Context, config ProviderConfig, tke *tiktoken
 	fullResponse := fullResponseContent.String()
 	tokenList := tke.Encode(fullResponse, nil, nil)
 	completionTokens := len(tokenList)
-
 	if toolCallChunks == 0 {
 		providerLogger.Printf("[%s] Warning: no tool calls were observed in tool-calling mode (model returned only text/reasoning)", config.Name)
+		return 0, 0, 0, 0, fullResponse, fmt.Errorf("no tool calls observed in tool-calling mode")
 	}
 
 	providerLogger.Printf(
