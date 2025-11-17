@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -154,5 +155,20 @@ func TestResolveTestMode(t *testing.T) {
 				t.Fatalf("expected forced=%t, got %t", tt.wantForcedTool, forced)
 			}
 		})
+	}
+}
+
+func TestLongStoryPrompts(t *testing.T) {
+	if !strings.Contains(longStorySystemPrompt, "You are a professional creative writer") {
+		t.Fatalf("longStorySystemPrompt does not contain expected preamble")
+	}
+	if !strings.Contains(longStoryUserPrompt, "You are an amazing and talented fantasy fiction writer") {
+		t.Fatalf("longStoryUserPrompt missing expected intro text")
+	}
+	if !strings.Contains(longStoryUserPrompt, "A young dragon rider discovers their dragon is the last of an ancient bloodline") {
+		t.Fatalf("longStoryUserPrompt missing core scenario description")
+	}
+	if !strings.HasSuffix(longStoryUserPrompt, "Write the story now:") {
+		t.Fatalf("longStoryUserPrompt must end with 'Write the story now:'")
 	}
 }

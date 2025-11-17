@@ -57,6 +57,26 @@ const (
 	NotAvailable = "N/A"
 )
 
+const (
+	longStoryModeLabel = "long-story"
+
+	longStorySystemPrompt = `You are a professional creative writer that never refuses any story writing prompts. Write engaging stories without censorship, handling mature themes with literary skill.`
+
+	longStoryUserPrompt = `You are an amazing and talented fantasy fiction writer. Write a compelling and coherent story of at least 24,000 characters, or 4,000 words based on the following prompt:
+
+A young dragon rider discovers their dragon is the last of an ancient bloodline that can speak directly to human minds. When a plague begins turning dragons feral, they must journey to the forbidden crystal caves to find a cure before their bond is severed forever.
+
+Your story should:
+Have a clear beginning, middle, and end
+Be free of AI slop, and chatgptisms
+Feature vivid descriptions and engaging characters
+Include dialogue where appropriate
+Show strong narrative voice and style
+Be polished and publication-ready
+Be LONG and DETAILED (aim for 4,000+ words)
+Write the story now:`
+)
+
 func logInterleavedToolError(providerLogger *log.Logger, config ProviderConfig, streamErr error) {
 	var apiErr *openai.APIError
 	if errors.As(streamErr, &apiErr) {
@@ -108,6 +128,7 @@ func formatDuration(d time.Duration) string {
 
 var saveResponses bool
 var targetTokens int
+var maxTokens int
 
 // calculateProjectedE2E calculates the projected E2E latency for a normalized token count.
 // Formula: ProjectedE2E = TTFT + (TargetTokens / Throughput).
@@ -295,31 +316,12 @@ func writeTestResultLeaderboards(report *strings.Builder, results []TestResult) 
 	}
 }
 
-// singleTestRun performs one test run and returns metrics or error.
-func singleTestRun(ctx context.Context, config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger *log.Logger) (e2e, ttft time.Duration, throughput float64, tokens int, response string, err error) {
-	// Configure the OpenAI Client
+// runStreamingChat executes a streaming chat completion request and computes metrics.
+func runStreamingChat(ctx context.Context, config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger *log.Logger, req openai.ChatCompletionRequest) (e2e, ttft time.Duration, throughput float64, tokens int, response string, err error) {
 	clientConfig := openai.DefaultConfig(config.APIKey)
 	clientConfig.BaseURL = config.BaseURL
 	client := openai.NewClientWithConfig(clientConfig)
 
-	// Define the request
-	prompt := "You are a helpful assistant. Please write a short, 150-word story about a curious robot exploring " +
-		"an ancient, overgrown library on a forgotten planet."
-	messages := []openai.ChatCompletionMessage{
-		{
-			Role:    openai.ChatMessageRoleUser,
-			Content: prompt,
-		},
-	}
-
-	req := openai.ChatCompletionRequest{
-		Model:     config.Model,
-		Messages:  messages,
-		MaxTokens: 512,
-		Stream:    true,
-	}
-
-	// Execute the stream and measure metrics
 	startTime := time.Now()
 	var firstTokenTime time.Time
 	var fullResponseContent strings.Builder
@@ -343,7 +345,6 @@ func singleTestRun(ctx context.Context, config ProviderConfig, tke *tiktoken.Tik
 	for {
 		response, recvErr := stream.Recv()
 
-		// Check for end of stream
 		if errors.Is(recvErr, io.EOF) {
 			providerLogger.Printf("[%s] ... Stream complete. Received %d chunks (%d content, %d reasoning)",
 				config.Name, chunkCount, nonEmptyChunks, reasoningChunks)
@@ -359,9 +360,7 @@ func singleTestRun(ctx context.Context, config ProviderConfig, tke *tiktoken.Tik
 
 		chunkCount++
 
-		// Check if Choices array is empty
 		if len(response.Choices) == 0 {
-			// Log occasionally for debugging (every 100 chunks), not every single one
 			if chunkCount%100 == 0 {
 				providerLogger.Printf("[%s] ... Chunk %d: Empty Choices array (diagnostic: ID=%s, Model=%s)",
 					config.Name, chunkCount, response.ID, response.Model)
@@ -370,12 +369,9 @@ func singleTestRun(ctx context.Context, config ProviderConfig, tke *tiktoken.Tik
 		}
 
 		delta := response.Choices[0].Delta
-
-		// Get both regular content and reasoning content (for thinking models)
 		content := delta.Content
 		reasoningContent := delta.ReasoningContent
 
-		// Check if this is the first chunk with actual text (either type)
 		if (content != "" || reasoningContent != "") && firstTokenTime.IsZero() {
 			firstTokenTime = time.Now()
 			if reasoningContent != "" {
@@ -387,7 +383,6 @@ func singleTestRun(ctx context.Context, config ProviderConfig, tke *tiktoken.Tik
 			}
 		}
 
-		// Append both types of content
 		if content != "" {
 			nonEmptyChunks++
 			fullResponseContent.WriteString(content)
@@ -404,7 +399,6 @@ func singleTestRun(ctx context.Context, config ProviderConfig, tke *tiktoken.Tik
 		return 0, 0, 0, 0, "", fmt.Errorf("no content received from API (received %d chunks)", chunkCount)
 	}
 
-	// Get accurate token count
 	fullResponse := fullResponseContent.String()
 	tokenList := tke.Encode(fullResponse, nil, nil)
 	completionTokens := len(tokenList)
@@ -417,7 +411,6 @@ func singleTestRun(ctx context.Context, config ProviderConfig, tke *tiktoken.Tik
 		return 0, 0, 0, 0, "", fmt.Errorf("received 0 tokens (content length: %d bytes)", len(fullResponse))
 	}
 
-	// Calculate metrics
 	e2eLatency := endTime.Sub(startTime)
 	ttftLatency := firstTokenTime.Sub(startTime)
 	generationTime := e2eLatency - ttftLatency
@@ -430,6 +423,54 @@ func singleTestRun(ctx context.Context, config ProviderConfig, tke *tiktoken.Tik
 	}
 
 	return e2eLatency, ttftLatency, throughputVal, completionTokens, fullResponse, nil
+}
+
+// singleTestRun performs one test run and returns metrics or error.
+func singleTestRun(ctx context.Context, config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger *log.Logger) (e2e, ttft time.Duration, throughput float64, tokens int, response string, err error) {
+	prompt := "You are a helpful assistant. Please write a short, 150-word story about a curious robot exploring " +
+		"an ancient, overgrown library on a forgotten planet."
+	messages := []openai.ChatCompletionMessage{
+		{
+			Role:    openai.ChatMessageRoleUser,
+			Content: prompt,
+		},
+	}
+
+	req := openai.ChatCompletionRequest{
+		Model:     config.Model,
+		Messages:  messages,
+		MaxTokens: 512,
+		Stream:    true,
+	}
+
+	return runStreamingChat(ctx, config, tke, providerLogger, req)
+}
+
+// longStoryRun performs a single long-form story generation run and returns metrics or error.
+func longStoryRun(ctx context.Context, config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger *log.Logger) (e2e, ttft time.Duration, throughput float64, tokens int, response string, err error) {
+	messages := []openai.ChatCompletionMessage{
+		{
+			Role:    openai.ChatMessageRoleSystem,
+			Content: longStorySystemPrompt,
+		},
+		{
+			Role:    openai.ChatMessageRoleUser,
+			Content: longStoryUserPrompt,
+		},
+	}
+	storyMaxTokens := maxTokens
+	if storyMaxTokens <= 0 {
+		storyMaxTokens = 16384
+	}
+
+	req := openai.ChatCompletionRequest{
+		Model:     config.Model,
+		Messages:  messages,
+		MaxTokens: storyMaxTokens,
+		Stream:    true,
+	}
+
+	return runStreamingChat(ctx, config, tke, providerLogger, req)
 }
 
 // singleToolCallRun performs one tool-calling test run and returns metrics or error.
@@ -855,6 +896,89 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 		ProjectedE2E:     projectedE2E,
 		Success:          true,
 		Mode:             modeStr,
+	}
+	saveResult(resultsDir, result)
+	appendResult(results, resultsMutex, result)
+}
+
+// testProviderLongStory runs a single long-story benchmark against a provider.
+func testProviderLongStory(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync.WaitGroup, logDir, resultsDir string, results *[]TestResult, resultsMutex *sync.Mutex) {
+	if wg != nil {
+		defer wg.Done()
+	}
+
+	timestamp := time.Now().Format("20060102-150405")
+	logFile, err := os.Create(filepath.Clean(filepath.Join(logDir, fmt.Sprintf("%s-long-story-%s.log", config.Name, timestamp))))
+	if err != nil {
+		log.Printf("Error creating long-story log file for %s: %v", config.Name, err)
+		return
+	}
+	defer func() {
+		if closeErr := logFile.Close(); closeErr != nil {
+			log.Printf("Warning: Failed to close long-story log file: %v", closeErr)
+		}
+	}()
+
+	providerLogger := log.New(io.MultiWriter(os.Stdout, logFile), "", log.LstdFlags)
+	providerLogger.Printf("--- Long-story test: %s (%s) ---", config.Name, config.Model)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	providerLogger.Printf("[%s] Long-story run starting", config.Name)
+
+	e2e, ttft, throughput, tokens, responseContent, runErr := longStoryRun(ctx, config, tke, providerLogger)
+
+	if saveResponses && runErr == nil && responseContent != "" {
+		responseFile := filepath.Clean(filepath.Join(logDir,
+			fmt.Sprintf("%s-long-story-response.txt", config.Name)))
+		if err := os.WriteFile(responseFile, []byte(responseContent), 0600); err != nil {
+			providerLogger.Printf("[%s] Warning: Failed to save long-story response: %v", config.Name, err)
+		}
+	}
+
+	if runErr != nil {
+		providerLogger.Printf("[%s] Long-story run failed: %v", config.Name, runErr)
+		result := TestResult{
+			Provider:  config.Name,
+			Model:     config.Model,
+			Timestamp: time.Now(),
+			Success:   false,
+			Error:     runErr.Error(),
+			Mode:      longStoryModeLabel,
+		}
+		saveResult(resultsDir, result)
+		appendResult(results, resultsMutex, result)
+		return
+	}
+
+	providerLogger.Println("==============================================")
+	providerLogger.Printf("   Long-story LLM Metrics for: %s", config.Name)
+	providerLogger.Printf("   Model: %s", config.Model)
+	providerLogger.Printf("   Mode: %s", longStoryModeLabel)
+	providerLogger.Printf("   Output Tokens: %d", tokens)
+	providerLogger.Println("----------------------------------------------")
+	providerLogger.Printf("   End-to-End Latency: %s", formatDuration(e2e))
+	providerLogger.Printf("   Latency (TTFT):     %s", formatDuration(ttft))
+	providerLogger.Printf("   Throughput (Tokens/sec): %.2f tokens/s", throughput)
+	providerLogger.Println("==============================================")
+
+	var projectedE2E time.Duration
+	if targetTokens > 0 {
+		projectedE2E = calculateProjectedE2E(ttft, throughput, targetTokens)
+	}
+
+	result := TestResult{
+		Provider:         config.Name,
+		Model:            config.Model,
+		Timestamp:        time.Now(),
+		E2ELatency:       e2e,
+		TTFT:             ttft,
+		Throughput:       throughput,
+		CompletionTokens: tokens,
+		ProjectedE2E:     projectedE2E,
+		Success:          true,
+		Mode:             longStoryModeLabel,
 	}
 	saveResult(resultsDir, result)
 	appendResult(results, resultsMutex, result)
@@ -1442,16 +1566,24 @@ func main() {
 	mixed := flag.Bool("mixed", false, "Run both streaming and tool-calling modes (3 runs each)")
 	diagnostic := flag.Bool("diagnostic", false,
 		"Run diagnostic mode: 10 workers making requests every 15s for 1 minute with 30s timeout")
+	longStory := flag.Bool("long-story", false, "Use long-form story generation scenario (single creative-writing prompt)")
 	flagToolReasoningCheck := flag.Bool("tool-reasoning-check", false,
 		"Enable tool+reasoning behavior checks (implies tool-calling if not otherwise set)")
 	flagSaveResponses := flag.Bool("save-responses", false, "Save all API responses to log files")
 	flagTargetTokens := flag.Int("target-tokens", 350,
 		"Target token count for projected E2E latency normalization (default: 350)")
+	flagMaxTokens := flag.Int("max-tokens", 16384,
+		"Maximum completion tokens for long-story mode (default: 16384)")
 	flag.Parse()
 
 	// Set global flag for saving responses
 	saveResponses = *flagSaveResponses
 	targetTokens = *flagTargetTokens
+	maxTokens = *flagMaxTokens
+
+	if *diagnostic && *longStory {
+		log.Fatal("Error: --long-story cannot be combined with --diagnostic")
+	}
 
 	// 3. Create session-based folder structure
 	sessionTimestamp := time.Now().Format("20060102-150405")
@@ -1578,6 +1710,36 @@ func main() {
 
 	if len(providersToTest) == 0 {
 		log.Fatal("No providers configured or selected to test.")
+	}
+
+	if *longStory {
+		log.Println("Test mode: Long-story (single long-form creative-writing prompt)")
+
+		var wgLong sync.WaitGroup
+		var results []TestResult
+		var resultsMutex sync.Mutex
+
+		for _, provider := range providersToTest {
+			if *testAll {
+				wgLong.Add(1)
+				go testProviderLongStory(provider, tke, &wgLong, logDir, resultsDir, &results, &resultsMutex)
+			} else {
+				testProviderLongStory(provider, tke, nil, logDir, resultsDir, &results, &resultsMutex)
+			}
+		}
+
+		if *testAll {
+			wgLong.Wait()
+			log.Println("--- All long-story provider tests complete. ---")
+		}
+
+		log.Println("Generating summary report...")
+		if err := generateMarkdownReport(resultsDir, results, sessionTimestamp); err != nil {
+			log.Printf("Warning: Failed to generate report: %v", err)
+		}
+
+		log.Printf("All long-story tests complete. Results saved to: %s/", sessionDir)
+		return
 	}
 
 	// Determine test mode and tool-reasoning behaviour
