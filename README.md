@@ -66,10 +66,10 @@ make        # builds to ./llm-api-speed
 
 ```bash
 # Examples
-./llm-api-speed --provider nim --tool-calling
-./llm-api-speed --provider nim --mixed
-./llm-api-speed --provider nim --diagnostic
-./llm-api-speed --provider nim --long-story
+./llm-api-speed --provider nahcrof --tool-calling
+./llm-api-speed --provider nahcrof --mixed
+./llm-api-speed --provider nahcrof --diagnostic
+./llm-api-speed --provider nahcrof --long-story
 ./llm-api-speed --all --diagnostic --mixed
 ```
 
@@ -78,7 +78,7 @@ make        # builds to ./llm-api-speed
 Test if a model supports parallel tool calls with reasoning:
 
 ```bash
-./llm-api-speed --provider nim --tool-calling --interleaved-tools
+./llm-api-speed --provider nahcrof --tool-calling --interleaved-tools
 ```
 
 ### Projected E2E Latency
@@ -95,7 +95,7 @@ Normalize performance comparison across different output lengths:
 ### Save Responses
 
 ```bash
-./llm-api-speed --provider nim --save-responses
+./llm-api-speed --provider nahcrof --save-responses
 ```
 
 ## Configuration
@@ -120,7 +120,7 @@ MINIMAX_API_KEY=your_key_here
 MINIMAX_MODEL=MiniMax-M2
 
 NAHCROF_API_KEY=your_key_here
-NAHCROF_MODEL=minimax-m2
+NAHCROF_MODEL=kimi-k2-thinking
 ```
 
 ### Supported Providers
