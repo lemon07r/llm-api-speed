@@ -586,11 +586,9 @@ func singleToolCallRun(ctx context.Context, config ProviderConfig, tke *tiktoken
 
 		// Check if Choices array is empty
 		if len(response.Choices) == 0 {
-			// Log occasionally for debugging (every 100 chunks), not every single one
-			if chunkCount%100 == 0 {
-				providerLogger.Printf("[%s] ... Chunk %d: Empty Choices array (diagnostic: ID=%s, Model=%s)",
-					config.Name, chunkCount, response.ID, response.Model)
-			}
+			// Log EVERY empty chunk for deep debugging
+			providerLogger.Printf("[%s] ... Chunk %d: Empty Choices array (ID=%s, Model=%s, Object=%s)",
+				config.Name, chunkCount, response.ID, response.Model, response.Object)
 			continue
 		}
 
