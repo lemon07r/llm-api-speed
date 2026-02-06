@@ -525,7 +525,7 @@ func singleToolCallRun(ctx context.Context, config ProviderConfig, tke *tiktoken
 		MaxTokens: 512,
 		Stream:    true,
 	}
-	req.ToolChoice = "required"
+	req.ToolChoice = "auto"
 	if toolReasoningCheck {
 		req.ParallelToolCalls = true
 	}
