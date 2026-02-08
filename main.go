@@ -329,20 +329,20 @@ func printBoxDivider() {
 
 // printBoxLine prints a line inside the box.
 func printBoxLine(content string) {
-	padding := 70 - visibleLen(content)
+	padding := 68 - visibleLen(content)
 	if padding < 0 {
 		padding = 0
 	}
-	log.Println(colorize(colorCyan, symVLine) + " " + content + strings.Repeat(" ", padding) + colorize(colorCyan, symVLine))
+	log.Println(colorize(colorCyan, symVLine) + " " + content + strings.Repeat(" ", padding) + " " + colorize(colorCyan, symVLine))
 }
 
 // printBoxLineColored prints a line with specific color.
 func printBoxLineColored(content, lineColor string) {
-	padding := 70 - visibleLen(content)
+	padding := 68 - visibleLen(content)
 	if padding < 0 {
 		padding = 0
 	}
-	log.Println(colorize(colorCyan, symVLine) + " " + colorize(lineColor, content) + strings.Repeat(" ", padding) + colorize(colorCyan, symVLine))
+	log.Println(colorize(colorCyan, symVLine) + " " + colorize(lineColor, content) + strings.Repeat(" ", padding) + " " + colorize(colorCyan, symVLine))
 }
 
 // formatNumber formats large numbers with commas.
