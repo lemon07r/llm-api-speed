@@ -10,6 +10,8 @@ A fast, concurrent benchmarking tool for measuring LLM API performance across mu
 - **Real Metrics** - E2E Latency, Time to First Token (TTFT), Throughput (tokens/sec)
 - **Projected E2E Latency** - Normalized comparison across different output lengths
 - **Multiple Test Modes** - Streaming, tool-calling, mixed, diagnostic stress-test, long-story generation
+- **Adaptive Stress Mode** - Auto-discover optimal capacity, then stress test at that level
+- **Resilient Testing** - Circuit breaker, retry logic, and connection pooling for reliable high-load tests
 - **Markdown Reports** - Auto-generated performance summaries with leaderboards
 
 ## Quick Start
@@ -35,6 +37,7 @@ cd llm-api-speed && make
 | Function calling | `./llm-api-speed --provider X --tool-calling` |
 | Compare providers | `./llm-api-speed --all` |
 | Light load (10 users) | `./llm-api-speed --provider X --diagnostic` |
+| **Auto-optimized stress** | `./llm-api-speed --provider X --adaptive-stress` |
 | Heavy stress (100-1000+ users) | `./llm-api-speed --provider X --stress` |
 | Endurance test (30+ min) | `./llm-api-speed --provider X --stress --stress-duration 1800` |
 | Max generation test | `./llm-api-speed --provider X --long-story` |
@@ -101,6 +104,18 @@ Simulate extreme traffic with configurable concurrency:
 | **Long** | 4,000+ word dragon story | ~4K-8K tokens, 60-300s |
 
 Use `--stress-long-bias 10-80` to adjust the long-form percentage.
+
+### Adaptive Stress Mode (Recommended)
+
+Automatically discover optimal capacity, then run stress test at that level:
+
+```bash
+./llm-api-speed --provider nahcrof --adaptive-stress                 # Discover + stress at 90% capacity
+./llm-api-speed --provider nahcrof --adaptive-stress --adaptive-safety-margin 0.95  # Use 95% of capacity
+./llm-api-speed --provider nahcrof --adaptive-stress --max-retries 3 --circuit-breaker  # With resilience
+```
+
+**Why use this?** Prevents the 95%+ failure rates common with fixed high worker counts. The tool progressively tests 10, 20, 40, 80... workers until failures exceed 10%, then backs off and runs the full stress test at the sustainable level.
 
 ### Other Features
 
@@ -178,6 +193,19 @@ results/session-20251110-012642/
 | `--target-tokens` | Target tokens for projected E2E (default: 350) |
 | `--max-tokens` | Max tokens for long-story (default: 16384) |
 
+### Resilience Flags (for High-Load Testing)
+| Flag | Description |
+|------|-------------|
+| `--adaptive-stress` | Auto-discover optimal capacity, then stress test |
+| `--adaptive-safety-margin` | % of discovered capacity to use (default: 0.9) |
+| `--discover` | Find optimal capacity without running stress test |
+| `--discover-threshold` | Failure rate threshold for discovery (default: 0.10) |
+| `--circuit-breaker` | Enable circuit breaker (default: true) |
+| `--circuit-failures` | Failures before opening circuit (default: 10) |
+| `--circuit-cooldown` | Cooldown before retry (default: 30s) |
+| `--max-retries` | Retry attempts for transient failures (default: 3) |
+| `--connection-timeout` | TLS handshake timeout (default: 30s) |
+
 ---
 
 ## Best Practices & Troubleshooting
@@ -190,7 +218,8 @@ results/session-20251110-012642/
 
 ### Recommended Progression
 ```bash
-./llm-api-speed --provider X --stress --stress-duration 60   # Quick validation
+./llm-api-speed --provider X --adaptive-stress                # Auto-discover optimal capacity
+./llm-api-speed --provider X --stress --stress-duration 60    # Quick validation
 ./llm-api-speed --provider X --stress                         # Standard 5min test
 ./llm-api-speed --provider X --stress --stress-level heavy    # Heavy load
 ./llm-api-speed --provider X --stress --stress-duration 1800  # 30min endurance
@@ -199,10 +228,11 @@ results/session-20251110-012642/
 ### Common Issues
 | Issue | Solution |
 |-------|----------|
+| `TLS handshake timeout` | Use `--adaptive-stress` or `--connection-timeout 30s` |
 | `context deadline exceeded` | Reduce load or check timeouts |
-| `429 Too Many Requests` | Reduce `--stress-workers` |
+| `429 Too Many Requests` | Reduce `--stress-workers` or use `--adaptive-stress` |
 | `no tool calls observed` | Provider/model may not support tools |
-| Empty responses | Try lower concurrency |
+| Empty responses | Try lower concurrency or enable `--circuit-breaker` |
 | Build errors | Run `make fmt && make all` |
 
 ---

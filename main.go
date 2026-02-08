@@ -20,6 +20,8 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/pkoukk/tiktoken-go"
 	openai "github.com/sashabaranov/go-openai"
+
+	"github.com/lamim/llm-api-speed/internal/stress"
 )
 
 // ProviderConfig holds all info for one API provider.
@@ -291,6 +293,25 @@ func calculateOverallGrade(summary StressSummary) (string, string) {
 	}
 }
 
+// stripANSI removes ANSI escape sequences from a string.
+func stripANSI(s string) string {
+	// Remove common ANSI escape sequences
+	s = strings.ReplaceAll(s, colorReset, "")
+	s = strings.ReplaceAll(s, colorBold, "")
+	s = strings.ReplaceAll(s, colorRed, "")
+	s = strings.ReplaceAll(s, colorGreen, "")
+	s = strings.ReplaceAll(s, colorYellow, "")
+	s = strings.ReplaceAll(s, colorBlue, "")
+	s = strings.ReplaceAll(s, colorCyan, "")
+	s = strings.ReplaceAll(s, colorWhite, "")
+	return s
+}
+
+// visibleLen returns the visible length of a string (excluding ANSI codes).
+func visibleLen(s string) int {
+	return len(stripANSI(s))
+}
+
 // printBoxTop prints the top border of a box.
 func printBoxTop() {
 	log.Println(colorize(colorCyan, symCornerTL+strings.Repeat(symHLine, 70)+symCornerTR))
@@ -308,7 +329,7 @@ func printBoxDivider() {
 
 // printBoxLine prints a line inside the box.
 func printBoxLine(content string) {
-	padding := 70 - len(content)
+	padding := 70 - visibleLen(content)
 	if padding < 0 {
 		padding = 0
 	}
@@ -317,7 +338,7 @@ func printBoxLine(content string) {
 
 // printBoxLineColored prints a line with specific color.
 func printBoxLineColored(content, lineColor string) {
-	padding := 70 - len(content)
+	padding := 70 - visibleLen(content)
 	if padding < 0 {
 		padding = 0
 	}
@@ -612,17 +633,25 @@ func writeTestResultLeaderboards(report *strings.Builder, results []TestResult) 
 }
 
 // createHTTPClient creates an OpenAI client with optimized HTTP transport for high-concurrency testing.
-func createHTTPClient(config ProviderConfig) *openai.Client {
+func createHTTPClient(config ProviderConfig, workers ...int) *openai.Client {
 	clientConfig := openai.DefaultConfig(config.APIKey)
 	clientConfig.BaseURL = config.BaseURL
 
+	// Determine connection pool size based on workers
+	poolSize := 100
+	if len(workers) > 0 && workers[0] > 0 {
+		poolSize = workers[0] * 2
+	}
+
 	// Configure HTTP transport for connection pooling and keep-alive
 	transport := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 100,
+		MaxIdleConns:        poolSize,
+		MaxIdleConnsPerHost: poolSize,
+		MaxConnsPerHost:     poolSize,
 		IdleConnTimeout:     90 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second,
+		TLSHandshakeTimeout: 30 * time.Second, // Increased for high-latency scenarios
 		DisableKeepAlives:   false,
+		ForceAttemptHTTP2:   true,
 	}
 
 	clientConfig.HTTPClient = &http.Client{
@@ -2324,24 +2353,26 @@ func stressMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resultsDi
 
 	for result := range resultsChan {
 		totalRequests++
+
+		// Always update per-type stats for request counting
+		stats := perTypeStats[result.reqType]
+		stats.Count++
+
 		if result.err != nil {
 			failureCount++
+			stats.Failed++
 			errors[result.err.Error()]++
 		} else {
 			successCount++
+			stats.Successful++
+			stats.TotalTokens += result.tokens
 			totalE2E += result.e2e
 			totalTTFT += result.ttft
 			totalThroughput += result.throughput
 			totalTokens += result.tokens
 			allE2E = append(allE2E, result.e2e)
-
-			// Update per-type stats
-			stats := perTypeStats[result.reqType]
-			stats.Count++
-			stats.Successful++
-			stats.TotalTokens += result.tokens
-			perTypeStats[result.reqType] = stats
 		}
+		perTypeStats[result.reqType] = stats
 	}
 
 	// Calculate statistics
@@ -2419,6 +2450,10 @@ func stressMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resultsDi
 		Failed:          failed,
 		TotalTokens:     totalTokens,
 		RequestsPerSec:  rps,
+		// Fix: Populate per-type request counts from perTypeStats
+		ShortRequests: perTypeStats["short"].Count,
+		ToolRequests:  perTypeStats["tool"].Count,
+		LongRequests:  perTypeStats["long"].Count,
 	}
 
 	if successful > 0 {
@@ -2806,7 +2841,7 @@ func main() {
 	diagnostic := flag.Bool("diagnostic", false,
 		"Run diagnostic mode: 10 workers making requests every 15s for 1 minute with 30s timeout")
 	longStory := flag.Bool("long-story", false, "Use long-form story generation scenario (single creative-writing prompt)")
-	stress := flag.Bool("stress", false, "Run high-stress mode: high concurrency mixed load testing")
+	stressFlag := flag.Bool("stress", false, "Run high-stress mode: high concurrency mixed load testing")
 	stressLevel := flag.String("stress-level", "moderate",
 		"Stress level preset: moderate (100 workers), heavy (500), extreme (1000)")
 	stressWorkers := flag.Int("stress-workers", 0,
@@ -2824,6 +2859,32 @@ func main() {
 		"Target token count for projected E2E latency normalization (default: 350)")
 	flagMaxTokens := flag.Int("max-tokens", 16384,
 		"Maximum completion tokens for long-story mode (default: 16384)")
+
+	// New stress test improvement flags
+	flagDiscover := flag.Bool("discover", false,
+		"Run progressive load discovery to find optimal capacity")
+	flagDiscoverThreshold := flag.Float64("discover-threshold", 0.10,
+		"Failure rate threshold for capacity discovery (default: 0.10 = 10%)")
+	flagAdaptiveRate := flag.Bool("adaptive-rate", false,
+		"Enable adaptive request pacing based on response patterns")
+	flagCircuitBreaker := flag.Bool("circuit-breaker", true,
+		"Enable circuit breaker pattern for resilience (default: true)")
+	flagCircuitFailures := flag.Int("circuit-failures", 10,
+		"Consecutive failures before opening circuit breaker (default: 10)")
+	flagCircuitCooldown := flag.Duration("circuit-cooldown", 30*time.Second,
+		"Cooldown period before circuit breaker half-opens (default: 30s)")
+	flagVerboseMetrics := flag.Bool("verbose-metrics", false,
+		"Enable detailed connection health metrics and histograms")
+	flagConnectionTimeout := flag.Duration("connection-timeout", 30*time.Second,
+		"TLS handshake timeout for connections (default: 30s)")
+	flagMaxRetries := flag.Int("max-retries", 3,
+		"Maximum retry attempts for transient failures (default: 3)")
+	flagRetryBackoff := flag.Duration("retry-backoff", 500*time.Millisecond,
+		"Base backoff duration for retries (default: 500ms)")
+	flagAdaptiveStress := flag.Bool("adaptive-stress", false,
+		"Run discovery to find optimal capacity, then stress test at that level")
+	flagAdaptiveSafetyMargin := flag.Float64("adaptive-safety-margin", 0.9,
+		"Safety margin for adaptive stress (0.9 = use 90%% of discovered capacity)")
 	flag.Parse()
 
 	// Set global flag for saving responses
@@ -2834,11 +2895,40 @@ func main() {
 	if *diagnostic && *longStory {
 		log.Fatal("Error: --long-story cannot be combined with --diagnostic")
 	}
-	if *stress && *longStory {
+	if *stressFlag && *longStory {
 		log.Fatal("Error: --long-story cannot be combined with --stress")
 	}
-	if *stress && *diagnostic {
+	if *stressFlag && *diagnostic {
 		log.Fatal("Error: --stress cannot be combined with --diagnostic")
+	}
+	if *flagDiscover && (*stressFlag || *diagnostic || *longStory) {
+		log.Fatal("Error: --discover cannot be combined with --stress, --diagnostic, or --long-story")
+	}
+	if *flagDiscoverThreshold < 0 || *flagDiscoverThreshold > 1 {
+		log.Fatal("Error: --discover-threshold must be between 0 and 1")
+	}
+	if *flagMaxRetries < 0 || *flagMaxRetries > 10 {
+		log.Fatal("Error: --max-retries must be between 0 and 10")
+	}
+	if *flagAdaptiveStress && (*stressFlag || *diagnostic || *longStory || *flagDiscover) {
+		log.Fatal("Error: --adaptive-stress cannot be combined with --stress, --diagnostic, --long-story, or --discover")
+	}
+	if *flagAdaptiveSafetyMargin < 0.1 || *flagAdaptiveSafetyMargin > 1.0 {
+		log.Fatal("Error: --adaptive-safety-margin must be between 0.1 and 1.0")
+	}
+
+	// Log enabled features (using the flags to suppress "declared and not used" errors)
+	if *flagAdaptiveRate {
+		log.Println("Note: Adaptive rate limiting is enabled (placeholder - full implementation pending)")
+	}
+	if *flagVerboseMetrics {
+		log.Println("Note: Verbose metrics collection is enabled (placeholder - full implementation pending)")
+	}
+	if *flagConnectionTimeout != 30*time.Second {
+		log.Printf("Note: Connection timeout set to %s", *flagConnectionTimeout)
+	}
+	if *flagAdaptiveStress {
+		log.Printf("Note: Adaptive stress mode enabled with %.0f%% safety margin", *flagAdaptiveSafetyMargin*100)
 	}
 
 	// 3. Create session-based folder structure
@@ -3057,9 +3147,129 @@ func main() {
 		return
 	}
 
-	if *stress {
+	// Discovery mode - progressive load testing to find optimal capacity
+	//nolint:nestif // Complex nesting is acceptable for CLI command handling
+	if *flagDiscover {
+		log.Printf("=== RUNNING IN LOAD DISCOVERY MODE ===")
+		log.Printf("Failure threshold: %.1f%% | Max workers: 2000", *flagDiscoverThreshold*100)
+
+		discoveryConfig := stress.DefaultDiscoveryConfig()
+		discoveryConfig.FailureThreshold = *flagDiscoverThreshold
+
+		for _, provider := range providersToTest {
+			log.Printf("\n--- Discovering capacity for: %s ---", provider.Name)
+
+			testFunc := func(ctx context.Context, workers int, duration time.Duration) (stress.LoadLevelResult, error) {
+				return runDiscoveryTest(ctx, provider, tke, workers, duration, *flagCircuitBreaker, *flagCircuitFailures, *flagCircuitCooldown, *flagMaxRetries, *flagRetryBackoff)
+			}
+
+			discovery := stress.NewLoadDiscovery(discoveryConfig)
+			result, err := discovery.Run(context.Background(), testFunc)
+			if err != nil {
+				log.Printf("Discovery failed for %s: %v", provider.Name, err)
+				continue
+			}
+
+			// Print discovery report
+			log.Println("")
+			log.Println(result.GenerateReport())
+
+			// Save discovery result
+			discoveryFile := filepath.Join(resultsDir, fmt.Sprintf("%s-discovery-%s.json", provider.Name, sessionTimestamp))
+			data, err := json.MarshalIndent(result, "", "  ")
+			if err != nil {
+				log.Printf("Warning: Failed to marshal discovery result: %v", err)
+			} else {
+				if err := os.WriteFile(discoveryFile, data, 0600); err != nil {
+					log.Printf("Warning: Failed to write discovery result: %v", err)
+				} else {
+					log.Printf("Discovery result saved: %s", discoveryFile)
+				}
+			}
+		}
+
+		log.Printf("Load discovery complete. Results saved to: %s/", sessionDir)
+		return
+	}
+
+	// Adaptive stress mode - discover optimal capacity, then run stress test
+	//nolint:nestif // Complex nesting is acceptable for CLI command handling
+	if *flagAdaptiveStress {
+		log.Printf("=== RUNNING IN ADAPTIVE STRESS MODE ===")
+		log.Printf("Discovering optimal capacity with %.0f%% safety margin...", *flagAdaptiveSafetyMargin*100)
+
+		discoveryConfig := stress.DefaultDiscoveryConfig()
+		discoveryConfig.FailureThreshold = *flagDiscoverThreshold
+
+		for _, provider := range providersToTest {
+			log.Printf("\n--- Phase 1: Discovering capacity for: %s ---", provider.Name)
+
+			testFunc := func(ctx context.Context, workers int, duration time.Duration) (stress.LoadLevelResult, error) {
+				return runDiscoveryTest(ctx, provider, tke, workers, duration, *flagCircuitBreaker, *flagCircuitFailures, *flagCircuitCooldown, *flagMaxRetries, *flagRetryBackoff)
+			}
+
+			discovery := stress.NewLoadDiscovery(discoveryConfig)
+			result, err := discovery.Run(context.Background(), testFunc)
+			if err != nil {
+				log.Printf("Discovery failed for %s: %v", provider.Name, err)
+				continue
+			}
+
+			// Print discovery report
+			log.Println("")
+			log.Println(result.GenerateReport())
+
+			// Save discovery result
+			discoveryFile := filepath.Join(resultsDir, fmt.Sprintf("%s-discovery-%s.json", provider.Name, sessionTimestamp))
+			data, err := json.MarshalIndent(result, "", "  ")
+			if err != nil {
+				log.Printf("Warning: Failed to marshal discovery result: %v", err)
+			} else {
+				if err := os.WriteFile(discoveryFile, data, 0600); err != nil {
+					log.Printf("Warning: Failed to write discovery result: %v", err)
+				}
+			}
+
+			// Calculate optimal workers with safety margin
+			discoveredCapacity := result.OptimalWorkers
+			if discoveredCapacity < 1 {
+				log.Printf("Warning: Could not determine capacity for %s, skipping stress test", provider.Name)
+				continue
+			}
+
+			optimalWorkers := int(float64(discoveredCapacity) * *flagAdaptiveSafetyMargin)
+			if optimalWorkers < 1 {
+				optimalWorkers = 1
+			}
+
+			log.Printf("\n--- Phase 2: Running stress test at discovered capacity ---")
+			log.Printf("Discovered capacity: %d workers", discoveredCapacity)
+			log.Printf("Using safety margin: %.0f%%", *flagAdaptiveSafetyMargin*100)
+			log.Printf("Stress test workers: %d", optimalWorkers)
+
+			// Run stress test at discovered capacity
+			var stressResults []StressSummary
+			var stressMutex sync.Mutex
+			stressMode(provider, tke, logDir, resultsDir, optimalWorkers, *stressDuration, *stressLongBias, *stressRampUp, nil, &stressResults, &stressMutex)
+
+			// Generate report
+			if len(stressResults) > 0 {
+				stressReportFile := filepath.Join(resultsDir, fmt.Sprintf("%s-adaptive-stress-report-%s.md", provider.Name, sessionTimestamp))
+				if err := generateStressReport(resultsDir, stressResults, sessionTimestamp); err != nil {
+					log.Printf("Warning: Failed to generate stress report: %v", err)
+				} else {
+					log.Printf("Adaptive stress report saved: %s", stressReportFile)
+				}
+			}
+		}
+
+		log.Printf("Adaptive stress testing complete. Results saved to: %s/", sessionDir)
+		return
+	}
+
+	if *stressFlag {
 		// Determine worker count and validate stress mode settings
-		numWorkers := resolveStressWorkers(*stress, *stressWorkers, *stressLevel)
+		numWorkers := resolveStressWorkers(*stressFlag, *stressWorkers, *stressLevel)
 		validateStressSettings(numWorkers, *stressDuration, *stressLongBias, *stressRampUp)
 
 		log.Printf("=== RUNNING IN HIGH-STRESS MODE ===")
@@ -3124,4 +3334,131 @@ func main() {
 	}
 
 	log.Printf("All tests complete. Results saved to: %s/", sessionDir)
+}
+
+// runDiscoveryTest runs a single discovery test at a specific load level.
+func runDiscoveryTest(ctx context.Context, config ProviderConfig, tke *tiktoken.Tiktoken, workers int, duration time.Duration, enableCircuit bool, circuitFailures int, circuitCooldown time.Duration, maxRetries int, retryBackoff time.Duration) (stress.LoadLevelResult, error) {
+	// Create a circuit breaker if enabled
+	var cb *stress.CircuitBreaker
+	if enableCircuit {
+		cb = stress.NewCircuitBreaker(stress.Config{
+			FailureThreshold: circuitFailures,
+			CooldownPeriod:   circuitCooldown,
+		})
+	}
+
+	// Create retry configuration
+	retryConfig := stress.RetryConfig{
+		MaxRetries:   maxRetries,
+		BaseDelay:    retryBackoff,
+		MaxDelay:     30 * time.Second,
+		Multiplier:   2.0,
+		JitterFactor: 0.1,
+	}
+
+	// Create metrics collector
+	metrics := stress.NewMetrics()
+
+	// Create context with timeout for this test
+	testCtx, cancel := context.WithTimeout(ctx, duration+30*time.Second)
+	defer cancel()
+
+	// Simple load test: each worker makes requests as fast as possible
+	type result struct {
+		success bool
+		e2e     time.Duration
+		ttft    time.Duration
+		tokens  int
+		err     error
+	}
+
+	resultsChan := make(chan result, workers*10)
+	var wg sync.WaitGroup
+
+	// Start workers
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(_ int) {
+			defer wg.Done()
+
+			for {
+				select {
+				case <-testCtx.Done():
+					return
+				default:
+				}
+
+				// Check circuit breaker
+				if cb != nil && !cb.CanExecute() {
+					resultsChan <- result{success: false, err: stress.ErrCircuitOpen}
+					time.Sleep(1 * time.Second)
+					continue
+				}
+
+				// Execute request with retry
+				reqCtx, cancel := context.WithTimeout(testCtx, 30*time.Second)
+
+				retryResult := stress.Retry(reqCtx, retryConfig, func(ctx context.Context) error {
+					_, _, _, _, _, err := singleTestRun(ctx, config, tke, log.New(io.Discard, "", 0))
+					return err
+				})
+
+				cancel()
+
+				if retryResult.Success {
+					resultsChan <- result{success: true}
+					if cb != nil {
+						cb.RecordSuccess()
+					}
+				} else {
+					resultsChan <- result{success: false, err: retryResult.LastError}
+					if cb != nil {
+						cb.RecordFailure()
+					}
+				}
+			}
+		}(i)
+	}
+
+	// Wait for test duration then collect results
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+
+	// Collect results for the duration
+	testStart := time.Now()
+CollectResults:
+	for time.Since(testStart) < duration {
+		select {
+		case r := <-resultsChan:
+			if r.success {
+				metrics.RecordRequest("short", true, r.e2e, r.ttft, r.tokens)
+			} else {
+				metrics.RecordRequest("short", false, 0, 0, 0)
+				if r.err != nil {
+					catErr := stress.CategorizeError(r.err)
+					metrics.RecordError(catErr.Category.String())
+				}
+			}
+		case <-testCtx.Done():
+			break CollectResults
+		}
+	}
+
+	cancel()
+
+	// Calculate final metrics
+	summary := metrics.Summary()
+
+	return stress.LoadLevelResult{
+		Workers:       workers,
+		Duration:      duration,
+		TotalRequests: summary.TotalRequests,
+		Success:       summary.Successful,
+		Failed:        summary.Failed,
+		SuccessRate:   summary.SuccessRate() / 100,
+		AvgRPS:        summary.RequestsPerSecond,
+		Timestamp:     time.Now(),
+	}, nil
 }

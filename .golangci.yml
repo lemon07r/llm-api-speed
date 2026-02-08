@@ -135,6 +135,16 @@ issues:
       linters:
         - dupl
 
+    # Allow stuttering names in internal stress package for clarity
+    - path: internal/stress
+      linters:
+        - revive
+
+    # Allow complex nested blocks in main.go for discovery mode
+    - path: main.go
+      linters:
+        - nestif
+
 
 run:
   timeout: 10m
