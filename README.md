@@ -41,18 +41,6 @@ cd llm-api-speed && make
 
 ---
 
-## Cost Warning
-
-**Stress mode can generate significant costs.** 100 workers × 5 minutes can cost **$5-$50+** depending on model pricing.
-
-| Request Type | Cost | Max Tokens |
-|--------------|------|------------|
-| Short streaming | $0.001-$0.01 | 512 |
-| Tool-calling | $0.001-$0.01 | 512 |
-| Long-form | $0.10-$0.50 | 16,384 |
-
-Start with `--stress-duration 60` for quick, lower-cost tests.
-
 ## Usage
 
 ### Basic Commands
