@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,6 +55,8 @@ const (
 	ModeToolCalling TestMode = "tool-calling"
 	// ModeMixed represents mixed mode testing (both streaming and tool-calling).
 	ModeMixed TestMode = "mixed"
+	// ModeStress represents high-stress mode testing.
+	ModeStress TestMode = "stress"
 	// NotAvailable is a constant for unavailable metrics.
 	NotAvailable = "N/A"
 )
@@ -76,6 +80,260 @@ Be polished and publication-ready
 Be LONG and DETAILED (aim for 4,000+ words)
 Write the story now:`
 )
+
+// Terminal color codes for formatted output.
+const (
+	colorReset  = "\033[0m"
+	colorBold   = "\033[1m"
+	colorRed    = "\033[31m"
+	colorGreen  = "\033[32m"
+	colorYellow = "\033[33m"
+	colorBlue   = "\033[34m"
+	colorCyan   = "\033[36m"
+	colorWhite  = "\033[37m"
+)
+
+// Unicode symbols for terminal output.
+const (
+	symCheck    = "✓"
+	symCross    = "✗"
+	symDelta    = "▲"
+	symDiamond  = "◆"
+	symBullet   = "●"
+	symDash     = "─"
+	symCornerTL = "╔"
+	symCornerTR = "╗"
+	symCornerBL = "╚"
+	symCornerBR = "╝"
+	symHLine    = "═"
+	symVLine    = "║"
+	symCrossL   = "╠"
+	symCrossR   = "╣"
+)
+
+// isTerminal checks if stdout is a terminal.
+func isTerminal() bool {
+	stat, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return (stat.Mode() & os.ModeCharDevice) == os.ModeCharDevice
+}
+
+// colorize applies color to text if terminal supports it.
+func colorize(color, text string) string {
+	if !isTerminal() {
+		return text
+	}
+	return color + text + colorReset
+}
+
+// bold makes text bold if terminal supports it.
+func bold(text string) string {
+	return colorize(colorBold, text)
+}
+
+// StressSummary holds the aggregated results from a high-stress run.
+type StressSummary struct {
+	Provider        string
+	Model           string
+	Timestamp       time.Time
+	Workers         int
+	DurationSeconds int
+	TotalRequests   int
+	Successful      int
+	Failed          int
+	ShortRequests   int
+	ToolRequests    int
+	LongRequests    int
+	AvgE2ELatency   time.Duration
+	P50E2E          time.Duration
+	P95E2E          time.Duration
+	P99E2E          time.Duration
+	AvgTTFT         time.Duration
+	AvgThroughput   float64
+	RequestsPerSec  float64
+	TotalTokens     int
+	ProjectedE2E    time.Duration
+	Errors          map[string]int
+}
+
+// RequestTypeStats holds per-request-type statistics for stress mode.
+type RequestTypeStats struct {
+	Count         int
+	Successful    int
+	Failed        int
+	AvgE2E        time.Duration
+	MinE2E        time.Duration
+	MaxE2E        time.Duration
+	P50E2E        time.Duration
+	P95E2E        time.Duration
+	P99E2E        time.Duration
+	AvgTTFT       time.Duration
+	AvgThroughput float64
+	TotalTokens   int
+	AvgTokens     int
+}
+
+// HealthGrade represents a health assessment grade.
+type HealthGrade struct {
+	Symbol string
+	Label  string
+	Color  string
+}
+
+// gradeSuccessRate returns health grade for success rate.
+func gradeSuccessRate(rate float64) HealthGrade {
+	switch {
+	case rate >= 0.99:
+		return HealthGrade{symCheck, "EXCELLENT", colorGreen}
+	case rate >= 0.95:
+		return HealthGrade{symCheck, "GOOD", colorGreen}
+	case rate >= 0.90:
+		return HealthGrade{symDelta, "FAIR", colorYellow}
+	case rate >= 0.80:
+		return HealthGrade{symDelta, "POOR", colorYellow}
+	default:
+		return HealthGrade{symCross, "CRITICAL", colorRed}
+	}
+}
+
+// gradeLatencyP95 returns health grade for P95 latency.
+func gradeLatencyP95(p95 time.Duration) HealthGrade {
+	switch {
+	case p95 < 3*time.Second:
+		return HealthGrade{symCheck, "EXCELLENT", colorGreen}
+	case p95 < 5*time.Second:
+		return HealthGrade{symCheck, "GOOD", colorGreen}
+	case p95 < 10*time.Second:
+		return HealthGrade{symDelta, "FAIR", colorYellow}
+	case p95 < 20*time.Second:
+		return HealthGrade{symDelta, "POOR", colorYellow}
+	default:
+		return HealthGrade{symCross, "CRITICAL", colorRed}
+	}
+}
+
+// gradeThroughput returns health grade for throughput.
+func gradeThroughput(tps float64) HealthGrade {
+	switch {
+	case tps >= 150:
+		return HealthGrade{symCheck, "EXCELLENT", colorGreen}
+	case tps >= 100:
+		return HealthGrade{symCheck, "GOOD", colorGreen}
+	case tps >= 50:
+		return HealthGrade{symDelta, "FAIR", colorYellow}
+	case tps >= 20:
+		return HealthGrade{symDelta, "POOR", colorYellow}
+	default:
+		return HealthGrade{symCross, "CRITICAL", colorRed}
+	}
+}
+
+// gradeErrorRate returns health grade for error rate.
+func gradeErrorRate(rate float64) HealthGrade {
+	switch {
+	case rate < 0.01:
+		return HealthGrade{symCheck, "EXCELLENT", colorGreen}
+	case rate < 0.02:
+		return HealthGrade{symCheck, "GOOD", colorGreen}
+	case rate < 0.05:
+		return HealthGrade{symDelta, "FAIR", colorYellow}
+	case rate < 0.10:
+		return HealthGrade{symDelta, "POOR", colorYellow}
+	default:
+		return HealthGrade{symCross, "CRITICAL", colorRed}
+	}
+}
+
+// calculateOverallGrade calculates overall grade for stress test.
+func calculateOverallGrade(summary StressSummary) (string, string) {
+	successRate := float64(summary.Successful) / float64(summary.TotalRequests)
+	errorRate := float64(summary.Failed) / float64(summary.TotalRequests)
+
+	score := 0
+	if successRate >= 0.95 {
+		score += 2
+	} else if successRate >= 0.90 {
+		score++
+	}
+	if summary.P95E2E < 5*time.Second {
+		score += 2
+	} else if summary.P95E2E < 10*time.Second {
+		score++
+	}
+	if summary.AvgThroughput >= 100 {
+		score += 2
+	} else if summary.AvgThroughput >= 50 {
+		score++
+	}
+	if errorRate < 0.02 {
+		score += 2
+	} else if errorRate < 0.05 {
+		score++
+	}
+
+	switch {
+	case score >= 7:
+		return "A", colorize(colorGreen, "EXCELLENT")
+	case score >= 6:
+		return "A-", colorize(colorGreen, "VERY GOOD")
+	case score >= 5:
+		return "B+", colorize(colorGreen, "GOOD")
+	case score >= 4:
+		return "B", colorize(colorYellow, "SATISFACTORY")
+	case score >= 3:
+		return "C", colorize(colorYellow, "NEEDS IMPROVEMENT")
+	case score >= 2:
+		return "D", colorize(colorRed, "POOR")
+	default:
+		return "F", colorize(colorRed, "CRITICAL")
+	}
+}
+
+// printBoxTop prints the top border of a box.
+func printBoxTop() {
+	log.Println(colorize(colorCyan, symCornerTL+strings.Repeat(symHLine, 70)+symCornerTR))
+}
+
+// printBoxBottom prints the bottom border of a box.
+func printBoxBottom() {
+	log.Println(colorize(colorCyan, symCornerBL+strings.Repeat(symHLine, 70)+symCornerBR))
+}
+
+// printBoxDivider prints a horizontal divider.
+func printBoxDivider() {
+	log.Println(colorize(colorCyan, symCrossL+strings.Repeat(symHLine, 70)+symCrossR))
+}
+
+// printBoxLine prints a line inside the box.
+func printBoxLine(content string) {
+	padding := 70 - len(content)
+	if padding < 0 {
+		padding = 0
+	}
+	log.Println(colorize(colorCyan, symVLine) + " " + content + strings.Repeat(" ", padding) + colorize(colorCyan, symVLine))
+}
+
+// printBoxLineColored prints a line with specific color.
+func printBoxLineColored(content, lineColor string) {
+	padding := 70 - len(content)
+	if padding < 0 {
+		padding = 0
+	}
+	log.Println(colorize(colorCyan, symVLine) + " " + colorize(lineColor, content) + strings.Repeat(" ", padding) + colorize(colorCyan, symVLine))
+}
+
+// formatNumber formats large numbers with commas.
+func formatNumber(n int) string {
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	if n < 1000000 {
+		return fmt.Sprintf("%d,%03d", n/1000, n%1000)
+	}
+	return fmt.Sprintf("%d,%03d,%03d", n/1000000, (n%1000000)/1000, n%1000)
+}
 
 func logInterleavedToolError(providerLogger *log.Logger, config ProviderConfig, streamErr error) {
 	var apiErr *openai.APIError
@@ -119,6 +377,43 @@ func resolveTestMode(toolCalling, mixed, toolReasoningCheck bool) (TestMode, boo
 	}
 
 	return mode, toolReasoningCheck, forcedToolCalling
+}
+
+// resolveStressWorkers determines the number of workers for stress mode.
+func resolveStressWorkers(stress bool, stressWorkers int, stressLevel string) int {
+	if !stress {
+		return 0
+	}
+	if stressWorkers > 0 {
+		return stressWorkers
+	}
+	switch stressLevel {
+	case "moderate":
+		return 100
+	case "heavy":
+		return 500
+	case "extreme":
+		return 1000
+	default:
+		log.Fatalf("Error: Unknown stress level '%s'. Use: moderate, heavy, or extreme", stressLevel)
+		return 0
+	}
+}
+
+// validateStressSettings validates stress mode configuration parameters.
+func validateStressSettings(numWorkers, stressDuration, stressLongBias, stressRampUp int) {
+	if numWorkers < 1 {
+		log.Fatal("Error: --stress-workers must be at least 1")
+	}
+	if stressDuration < 60 {
+		log.Fatal("Error: --stress-duration must be at least 60 seconds")
+	}
+	if stressLongBias < 10 || stressLongBias > 80 {
+		log.Fatal("Error: --stress-long-bias must be between 10 and 80")
+	}
+	if stressRampUp < 1 {
+		log.Fatal("Error: --stress-rampup must be at least 1 second")
+	}
 }
 
 // formatDuration formats a duration as decimal seconds.
@@ -316,11 +611,31 @@ func writeTestResultLeaderboards(report *strings.Builder, results []TestResult) 
 	}
 }
 
-// runStreamingChat executes a streaming chat completion request and computes metrics.
-func runStreamingChat(ctx context.Context, config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger *log.Logger, req openai.ChatCompletionRequest) (e2e, ttft time.Duration, throughput float64, tokens int, response string, err error) {
+// createHTTPClient creates an OpenAI client with optimized HTTP transport for high-concurrency testing.
+func createHTTPClient(config ProviderConfig) *openai.Client {
 	clientConfig := openai.DefaultConfig(config.APIKey)
 	clientConfig.BaseURL = config.BaseURL
-	client := openai.NewClientWithConfig(clientConfig)
+
+	// Configure HTTP transport for connection pooling and keep-alive
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		DisableKeepAlives:   false,
+	}
+
+	clientConfig.HTTPClient = &http.Client{
+		Transport: transport,
+		Timeout:   0, // No global timeout - handled per-request via context
+	}
+
+	return openai.NewClientWithConfig(clientConfig)
+}
+
+// runStreamingChat executes a streaming chat completion request and computes metrics.
+func runStreamingChat(ctx context.Context, config ProviderConfig, tke *tiktoken.Tiktoken, providerLogger *log.Logger, req openai.ChatCompletionRequest) (e2e, ttft time.Duration, throughput float64, tokens int, response string, err error) {
+	client := createHTTPClient(config)
 
 	startTime := time.Now()
 	var firstTokenTime time.Time
@@ -707,6 +1022,422 @@ func singleToolCallRun(ctx context.Context, config ProviderConfig, tke *tiktoken
 	return e2eLatency, ttftLatency, throughputVal, completionTokens, fullResponse, nil
 }
 
+// healthCheck performs a single test request to verify endpoint is reachable before stress testing.
+func healthCheck(ctx context.Context, config ProviderConfig, _ *tiktoken.Tiktoken) error {
+	// Create a simple test request
+	prompt := "Hi, this is a health check. Respond with OK."
+	messages := []openai.ChatCompletionMessage{
+		{
+			Role:    openai.ChatMessageRoleUser,
+			Content: prompt,
+		},
+	}
+
+	req := openai.ChatCompletionRequest{
+		Model:     config.Model,
+		Messages:  messages,
+		MaxTokens: 10,
+		Stream:    true,
+	}
+
+	// Use a short timeout for health check
+	healthCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	client := createHTTPClient(config)
+	stream, err := client.CreateChatCompletionStream(healthCtx, req)
+	if err != nil {
+		return fmt.Errorf("health check failed: %w", err)
+	}
+	defer func() {
+		if closeErr := stream.Close(); closeErr != nil {
+			// Log but don't fail health check on close error
+			_ = closeErr
+		}
+	}()
+
+	// Try to receive at least one chunk
+	_, err = stream.Recv()
+	if err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("health check stream failed: %w", err)
+	}
+
+	return nil
+}
+
+// printStandardSummary prints a formatted terminal summary for standard test mode.
+func printStandardSummary(results []TestResult, config ProviderConfig) {
+	log.Println()
+	printBoxTop()
+	printBoxLineColored(bold("STANDARD TEST COMPLETE"), colorWhite)
+	printBoxLine(fmt.Sprintf("%s / %s", config.Name, config.Model))
+	printBoxDivider()
+	printBoxLine(bold("CONFIGURATION"))
+
+	modeStr := "streaming"
+	iterations := 3
+	for _, r := range results {
+		if r.Mode != "" {
+			modeStr = r.Mode
+			break
+		}
+	}
+	if modeStr == "mixed" {
+		iterations = 6
+	}
+
+	printBoxLine(fmt.Sprintf("  Mode:        %s (%d runs)", modeStr, iterations))
+	printBoxDivider()
+	printBoxLine(bold("RESULTS (Averaged)"))
+
+	modeResults := make(map[string][]TestResult)
+	for _, r := range results {
+		if r.Success {
+			modeResults[r.Mode] = append(modeResults[r.Mode], r)
+		}
+	}
+
+	printBoxLine("  ┌─────────────┬──────────┬──────────┬─────────────┬────────┐")
+	printBoxLine("  │ Mode        │ E2E      │ TTFT     │ Throughput  │ Tokens │")
+	printBoxLine("  ├─────────────┼──────────┼──────────┼─────────────┼────────┤")
+
+	modes := []string{"streaming", "tool-calling", "long-story"}
+	modeLabels := map[string]string{"streaming": "Streaming", "tool-calling": "Tool-Call", "long-story": "Long-Story"}
+	printedModes := make(map[string]bool)
+
+	for _, mode := range modes {
+		if printedModes[mode] {
+			continue
+		}
+		if resList, ok := modeResults[mode]; ok && len(resList) > 0 {
+			printedModes[mode] = true
+			var avgE2E, avgTTFT time.Duration
+			var avgThroughput float64
+			var avgTokens int
+			for _, r := range resList {
+				avgE2E += r.E2ELatency
+				avgTTFT += r.TTFT
+				avgThroughput += r.Throughput
+				avgTokens += r.CompletionTokens
+			}
+			count := len(resList)
+			avgE2E /= time.Duration(count)
+			avgTTFT /= time.Duration(count)
+			avgThroughput /= float64(count)
+			avgTokens /= count
+
+			label := modeLabels[mode]
+			if label == "" {
+				label = mode
+			}
+			line := fmt.Sprintf("  │ %-11s │ %8s │ %8s │ %8.1f/s  │ %6d │",
+				label,
+				formatDuration(avgE2E),
+				formatDuration(avgTTFT),
+				avgThroughput,
+				avgTokens)
+			printBoxLine(line)
+		}
+	}
+
+	printBoxLine("  └─────────────┴──────────┴──────────┴─────────────┴────────┘")
+
+	failed := 0
+	for _, r := range results {
+		if !r.Success {
+			failed++
+		}
+	}
+
+	printBoxDivider()
+	if failed == 0 {
+		printBoxLineColored(bold("STATUS: ")+colorize(colorGreen, symCheck+" All tests passed"), colorGreen)
+	} else {
+		printBoxLineColored(bold("STATUS: ")+colorize(colorRed, fmt.Sprintf("%s %d of %d tests failed", symCross, failed, len(results))), colorRed)
+	}
+	printBoxBottom()
+	log.Println()
+}
+
+// printDiagnosticSummary prints a formatted terminal summary for diagnostic mode.
+func printDiagnosticSummary(summary DiagnosticSummary, config ProviderConfig) {
+	log.Println()
+	printBoxTop()
+	printBoxLineColored(bold("DIAGNOSTIC TEST COMPLETE"), colorWhite)
+	printBoxLine(fmt.Sprintf("%s / %s", config.Name, config.Model))
+	printBoxDivider()
+	printBoxLine(bold("CONFIGURATION"))
+	printBoxLine("  Workers:  10    Duration:  90s    Interval:  15s")
+	printBoxLine("  Timeout:  30s")
+	printBoxDivider()
+	printBoxLine(bold("EXECUTION SUMMARY"))
+	printBoxLine(fmt.Sprintf("  Total Requests:    %s", formatNumber(summary.TotalRequests)))
+
+	successRate := 0.0
+	if summary.TotalRequests > 0 {
+		successRate = 100.0 * float64(summary.Successful) / float64(summary.TotalRequests)
+	}
+	failRate := 100.0 - successRate
+
+	if summary.Successful > 0 {
+		printBoxLine(fmt.Sprintf("  %s Successful:      %s (%.1f%%)", colorize(colorGreen, symCheck), formatNumber(summary.Successful), successRate))
+	} else {
+		printBoxLine("  ✓ Successful:      0 (0.0%)")
+	}
+
+	if summary.Failed > 0 {
+		printBoxLine(fmt.Sprintf("  %s Failed:          %s (%.1f%%)", colorize(colorRed, symCross), formatNumber(summary.Failed), failRate))
+	} else {
+		printBoxLine("  ✗ Failed:          0 (0.0%)")
+	}
+
+	printBoxDivider()
+	printBoxLine(bold("PERFORMANCE METRICS"))
+
+	if summary.Successful > 0 {
+		printBoxLine(fmt.Sprintf("  Avg E2E:        %s      P50:  %s      P95:  %s",
+			formatDuration(summary.AvgE2ELatency),
+			formatDuration(summary.AvgE2ELatency),
+			formatDuration(summary.AvgE2ELatency)))
+		printBoxLine(fmt.Sprintf("  Avg TTFT:       %s      Min:  %s      Max:  %s",
+			formatDuration(summary.AvgTTFT),
+			formatDuration(summary.AvgTTFT),
+			formatDuration(summary.AvgTTFT)))
+		printBoxLine(fmt.Sprintf("  Avg Throughput: %.1f tok/s", summary.AvgThroughput))
+		printBoxLine(fmt.Sprintf("  Avg Tokens:     %d", summary.AvgTokens))
+	} else {
+		printBoxLine("  No successful requests to calculate metrics")
+	}
+
+	if len(summary.Errors) > 0 {
+		printBoxDivider()
+		printBoxLine(bold("ERROR BREAKDOWN"))
+		for errMsg, count := range summary.Errors {
+			printBoxLine(fmt.Sprintf("  %s %s (x%d)", symCross, errMsg, count))
+		}
+	}
+
+	if summary.Successful > 0 {
+		printBoxDivider()
+		printBoxLine(bold("HEALTH ASSESSMENT"))
+		srGrade := gradeSuccessRate(successRate / 100.0)
+		printBoxLine(fmt.Sprintf("  %s Success Rate:  %s (%.1f%%)", colorize(srGrade.Color, srGrade.Symbol), srGrade.Label, successRate))
+	}
+
+	printBoxBottom()
+	log.Println()
+}
+
+// printLongStorySummary prints a formatted terminal summary for long-story mode.
+func printLongStorySummary(result TestResult, config ProviderConfig) {
+	log.Println()
+	printBoxTop()
+	printBoxLineColored(bold("LONG-FORM GENERATION COMPLETE"), colorWhite)
+	printBoxLine(fmt.Sprintf("%s / %s", config.Name, config.Model))
+	printBoxDivider()
+	printBoxLine(bold("CONFIGURATION"))
+	printBoxLine("  Target:  ~4,000 words    Max tokens:  16,384")
+	printBoxLine("  Timeout: 10 minutes")
+	printBoxDivider()
+	printBoxLine(bold("RESULTS"))
+
+	if result.Success {
+		printBoxLineColored("  Status:          "+symCheck+" SUCCESS", colorGreen)
+		printBoxLine(fmt.Sprintf("  Output Tokens:   %s", formatNumber(result.CompletionTokens)))
+		wordCount := result.CompletionTokens * 2 / 3
+		printBoxLine(fmt.Sprintf("  Word Count:      ~%s words", formatNumber(wordCount)))
+		printBoxLine("  " + strings.Repeat(symDash, 40))
+		printBoxLine(fmt.Sprintf("  E2E Latency:     %s", formatDuration(result.E2ELatency)))
+		printBoxLine(fmt.Sprintf("  TTFT:            %s", formatDuration(result.TTFT)))
+		printBoxLine(fmt.Sprintf("  Throughput:      %.1f tok/s", result.Throughput))
+		genTime := result.E2ELatency - result.TTFT
+		printBoxLine(fmt.Sprintf("  Generation Time: %s", formatDuration(genTime)))
+		printBoxDivider()
+		printBoxLine(bold("QUALITY METRICS"))
+		tokensPerWord := float64(result.CompletionTokens) / float64(wordCount)
+		printBoxLine(fmt.Sprintf("  Tokens per word:  %.2f  (Good coherence indicator)", tokensPerWord))
+		wordsPerMin := float64(wordCount) / genTime.Minutes()
+		printBoxLine(fmt.Sprintf("  Generation rate:  %.1f words/minute", wordsPerMin))
+		printBoxDivider()
+		printBoxLineColored(bold("STATUS: ")+colorize(colorGreen, symCheck+" Story generated successfully"), colorGreen)
+	} else {
+		printBoxLineColored("  Status:          "+symCross+" FAILED", colorRed)
+		printBoxLine(fmt.Sprintf("  Error:           %s", result.Error))
+		printBoxDivider()
+		printBoxLineColored(bold("STATUS: ")+colorize(colorRed, symCross+" Generation failed"), colorRed)
+	}
+
+	printBoxBottom()
+	log.Println()
+}
+
+// printStressSummary prints a formatted terminal summary for stress mode.
+func printStressSummary(summary StressSummary, perTypeStats map[string]RequestTypeStats, config ProviderConfig) {
+	log.Println()
+	printBoxTop()
+	printBoxLineColored(bold("HIGH-STRESS TEST COMPLETE"), colorWhite)
+	printBoxLine(fmt.Sprintf("%s / %s", config.Name, config.Model))
+	printBoxDivider()
+	printBoxLine(bold("CONFIGURATION"))
+	printBoxLine(fmt.Sprintf("  Workers:     %d        Duration:    %s", summary.Workers, formatDuration(time.Duration(summary.DurationSeconds)*time.Second)))
+	printBoxLine(fmt.Sprintf("  Start time:  %s", summary.Timestamp.Format("15:04:05")))
+	printBoxDivider()
+	printBoxLine(bold("EXECUTION SUMMARY"))
+	printBoxLine(fmt.Sprintf("  Total Requests:    %s", formatNumber(summary.TotalRequests)))
+
+	successRate := 0.0
+	if summary.TotalRequests > 0 {
+		successRate = 100.0 * float64(summary.Successful) / float64(summary.TotalRequests)
+	}
+	failRate := 100.0 - successRate
+
+	if summary.Successful > 0 {
+		printBoxLine(fmt.Sprintf("  %s Successful:      %s (%.1f%%)", colorize(colorGreen, symCheck), formatNumber(summary.Successful), successRate))
+	} else {
+		printBoxLine("  ✓ Successful:      0 (0.0%)")
+	}
+
+	if summary.Failed > 0 {
+		printBoxLine(fmt.Sprintf("  %s Failed:          %s (%.1f%%)", colorize(colorRed, symCross), formatNumber(summary.Failed), failRate))
+	} else {
+		printBoxLine("  ✗ Failed:          0 (0.0%)")
+	}
+
+	printBoxLine("  " + strings.Repeat(symDash, 40))
+	printBoxLine(fmt.Sprintf("  RPS:               %.2f req/s", summary.RequestsPerSec))
+	printBoxLine(fmt.Sprintf("  Total Tokens:      %s", formatNumber(summary.TotalTokens)))
+	printBoxLine(fmt.Sprintf("  Avg Throughput:    %.2f tok/s", summary.AvgThroughput))
+
+	printBoxDivider()
+	printBoxLine(bold("LATENCY DISTRIBUTION (End-to-End)"))
+	printBoxLine(fmt.Sprintf("  P50:   %s        P95:   %s        P99:   %s",
+		formatDuration(summary.P50E2E),
+		formatDuration(summary.P95E2E),
+		formatDuration(summary.P99E2E)))
+	printBoxLine(fmt.Sprintf("  Avg:   %s", formatDuration(summary.AvgE2ELatency)))
+
+	printBoxDivider()
+	printBoxLine(bold("REQUEST TYPE BREAKDOWN"))
+	printBoxLine("  ┌─────────┬─────────┬────────┬──────────┬──────────┬─────────┐")
+	printBoxLine("  │ Type    │ Count   │ %      │ Avg E2E  │ Avg Tok  │ Failed  │")
+	printBoxLine("  ├─────────┼─────────┼────────┼──────────┼──────────┼─────────┤")
+
+	totalReqs := summary.ShortRequests + summary.ToolRequests + summary.LongRequests
+	types := []struct {
+		name  string
+		count int
+		stats RequestTypeStats
+	}{
+		{"Short", summary.ShortRequests, perTypeStats["short"]},
+		{"Tool", summary.ToolRequests, perTypeStats["tool"]},
+		{"Long", summary.LongRequests, perTypeStats["long"]},
+	}
+
+	for _, t := range types {
+		if t.count > 0 {
+			pct := 100.0 * float64(t.count) / float64(totalReqs)
+			avgE2E := formatDuration(t.stats.AvgE2E)
+			if t.stats.AvgE2E == 0 {
+				avgE2E = "N/A"
+			}
+			avgTok := fmt.Sprintf("%d", t.stats.AvgTokens)
+			if t.stats.AvgTokens == 0 && t.stats.Count > 0 {
+				avgTok = fmt.Sprintf("~%d", t.stats.TotalTokens/t.stats.Count)
+			}
+			line := fmt.Sprintf("  │ %-7s │ %7s │ %5.1f%% │ %8s │ %8s │ %7d │",
+				t.name,
+				formatNumber(t.count),
+				pct,
+				avgE2E,
+				avgTok,
+				t.stats.Failed)
+			printBoxLine(line)
+		}
+	}
+	printBoxLine("  └─────────┴─────────┴────────┴──────────┴──────────┴─────────┘")
+
+	hasPercentiles := false
+	for _, stats := range perTypeStats {
+		if stats.P50E2E > 0 {
+			hasPercentiles = true
+			break
+		}
+	}
+
+	if hasPercentiles {
+		printBoxDivider()
+		printBoxLine(bold("REQUEST TYPE LATENCY PERCENTILES"))
+		printBoxLine("  ┌─────────┬─────────┬─────────┬─────────┐")
+		printBoxLine("  │ Type    │ P50     │ P95     │ P99     │")
+		printBoxLine("  ├─────────┼─────────┼─────────┼─────────┤")
+
+		for _, t := range types {
+			if t.count > 0 && t.stats.P50E2E > 0 {
+				line := fmt.Sprintf("  │ %-7s │ %7s │ %7s │ %7s │",
+					t.name,
+					formatDuration(t.stats.P50E2E),
+					formatDuration(t.stats.P95E2E),
+					formatDuration(t.stats.P99E2E))
+				printBoxLine(line)
+			}
+		}
+		printBoxLine("  └─────────┴─────────┴─────────┴─────────┘")
+	}
+
+	if len(summary.Errors) > 0 {
+		printBoxDivider()
+		printBoxLine(bold("TOP ERRORS"))
+		errorList := make([]struct {
+			msg   string
+			count int
+		}, 0, len(summary.Errors))
+		for msg, count := range summary.Errors {
+			errorList = append(errorList, struct {
+				msg   string
+				count int
+			}{msg, count})
+		}
+		for i := 0; i < len(errorList); i++ {
+			for j := i + 1; j < len(errorList); j++ {
+				if errorList[j].count > errorList[i].count {
+					errorList[i], errorList[j] = errorList[j], errorList[i]
+				}
+			}
+		}
+		for i := 0; i < len(errorList) && i < 5; i++ {
+			errMsg := errorList[i].msg
+			if len(errMsg) > 50 {
+				errMsg = errMsg[:47] + "..."
+			}
+			printBoxLine(fmt.Sprintf("  %s %s (x%d)", symCross, errMsg, errorList[i].count))
+		}
+	}
+
+	if summary.Successful > 0 {
+		printBoxDivider()
+		printBoxLine(bold("HEALTH ASSESSMENT"))
+
+		srGrade := gradeSuccessRate(successRate / 100.0)
+		p95Grade := gradeLatencyP95(summary.P95E2E)
+		p99Grade := gradeLatencyP95(summary.P99E2E)
+		tpGrade := gradeThroughput(summary.AvgThroughput)
+		erGrade := gradeErrorRate(failRate / 100.0)
+
+		printBoxLine(fmt.Sprintf("  %s Success Rate    %5.1f%%     %s", colorize(srGrade.Color, srGrade.Symbol), successRate, srGrade.Label))
+		printBoxLine(fmt.Sprintf("  %s Latency P95     %7s     %s", colorize(p95Grade.Color, p95Grade.Symbol), formatDuration(summary.P95E2E), p95Grade.Label))
+		printBoxLine(fmt.Sprintf("  %s Latency P99     %7s     %s", colorize(p99Grade.Color, p99Grade.Symbol), formatDuration(summary.P99E2E), p99Grade.Label))
+		printBoxLine(fmt.Sprintf("  %s Throughput      %7.2f     %s", colorize(tpGrade.Color, tpGrade.Symbol), summary.AvgThroughput, tpGrade.Label))
+		printBoxLine(fmt.Sprintf("  %s Error Rate       %5.1f%%     %s", colorize(erGrade.Color, erGrade.Symbol), failRate, erGrade.Label))
+		printBoxLine("  " + strings.Repeat(symDash, 40))
+
+		grade, desc := calculateOverallGrade(summary)
+		printBoxLine(fmt.Sprintf("  OVERALL GRADE:  %s  (%s)", bold(grade), desc))
+	}
+
+	printBoxBottom()
+	log.Println()
+}
+
 // testProviderMetrics runs a full benchmark test against a single provider.
 // It runs 3 iterations and reports averaged results, with a 2-minute total timeout.
 func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync.WaitGroup, logDir, resultsDir string, results *[]TestResult, resultsMutex *sync.Mutex, mode TestMode, toolReasoningCheck bool) {
@@ -897,6 +1628,9 @@ func testProviderMetrics(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sync
 	}
 	saveResult(resultsDir, result)
 	appendResult(results, resultsMutex, result)
+
+	// Print formatted terminal summary
+	printStandardSummary([]TestResult{result}, config)
 }
 
 // testProviderLongStory runs a single long-story benchmark against a provider.
@@ -980,6 +1714,9 @@ func testProviderLongStory(config ProviderConfig, tke *tiktoken.Tiktoken, wg *sy
 	}
 	saveResult(resultsDir, result)
 	appendResult(results, resultsMutex, result)
+
+	// Print formatted terminal summary
+	printLongStorySummary(result, config)
 }
 
 // appendResult safely appends a result to the shared results slice.
@@ -1203,6 +1940,10 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 				case ModeStreaming:
 					testMode = ModeStreaming
 					e2e, ttft, throughput, tokens, responseContent, reqErr = singleTestRun(reqCtx, config, tke, providerLogger)
+				case ModeStress:
+					// Stress mode is handled separately, not in diagnostic mode
+					testMode = ModeStreaming
+					e2e, ttft, throughput, tokens, responseContent, reqErr = singleTestRun(reqCtx, config, tke, providerLogger)
 				default:
 					testMode = ModeStreaming
 					e2e, ttft, throughput, tokens, responseContent, reqErr = singleTestRun(reqCtx, config, tke, providerLogger)
@@ -1376,6 +2117,349 @@ func diagnosticMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resul
 		*results = append(*results, summary)
 		resultsMutex.Unlock()
 	}
+
+	// Print formatted terminal summary
+	printDiagnosticSummary(summary, config)
+}
+
+// stressMode runs high-concurrency stress testing with configurable workers and duration.
+// Uses weighted random request distribution: short streaming, tool-calling, and long-form.
+// Features gradual ramp-up, proper randomization per worker, and connection pooling.
+func stressMode(config ProviderConfig, tke *tiktoken.Tiktoken, logDir, resultsDir string, numWorkers, durationSec, longBias, rampUpSec int, wg *sync.WaitGroup, results *[]StressSummary, resultsMutex *sync.Mutex) {
+	if wg != nil {
+		defer wg.Done()
+	}
+
+	timestamp := time.Now().Format("20060102-150405")
+	logFileName := filepath.Clean(filepath.Join(logDir, fmt.Sprintf("%s-stress-%s.log", config.Name, timestamp)))
+	logFile, err := os.Create(logFileName)
+	if err != nil {
+		log.Printf("Error creating stress log file for %s: %v", config.Name, err)
+		return
+	}
+	defer func() {
+		if closeErr := logFile.Close(); closeErr != nil {
+			log.Printf("Warning: Failed to close log file: %v", closeErr)
+		}
+	}()
+
+	providerLogger := log.New(io.MultiWriter(os.Stdout, logFile), "", log.LstdFlags)
+	providerLogger.Printf("=== HIGH-STRESS MODE: %s (%s) ===", config.Name, config.Model)
+	providerLogger.Printf("Workers: %d | Duration: %ds | Long-form bias: %d%% | Ramp-up: %ds", numWorkers, durationSec, longBias, rampUpSec)
+
+	// Validate and adjust long bias
+	if longBias < 10 {
+		longBias = 10
+	}
+	if longBias > 80 {
+		longBias = 80
+	}
+
+	// Calculate weights for optimal stress mix: ~50% short, ~20% tool, ~30% long (adjustable via longBias)
+	remainingWeight := float64(100 - longBias)
+	streamingWeight := remainingWeight * 0.71
+	toolWeight := remainingWeight * 0.29
+	longWeight := float64(longBias)
+	totalWeight := streamingWeight + toolWeight + longWeight
+
+	providerLogger.Printf("Request distribution: %.0f%% streaming, %.0f%% tool-calling, %.0f%% long-form",
+		streamingWeight/totalWeight*100, toolWeight/totalWeight*100, longWeight/totalWeight*100)
+
+	// Perform health check before spawning workers
+	providerLogger.Println("Performing health check...")
+	healthCtx, healthCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if err := healthCheck(healthCtx, config, tke); err != nil {
+		providerLogger.Printf("Health check FAILED: %v", err)
+		providerLogger.Println("Aborting stress test - endpoint is not reachable")
+		healthCancel()
+		return
+	}
+	healthCancel()
+	providerLogger.Println("Health check PASSED - proceeding with stress test")
+
+	// Create session context with configured duration plus buffer
+	sessionDuration := time.Duration(durationSec) * time.Second
+	sessionCtx, sessionCancel := context.WithTimeout(context.Background(), sessionDuration+60*time.Second)
+	defer sessionCancel()
+
+	sessionStartTime := time.Now()
+	rampUpComplete := make(chan bool, 1)
+
+	// Metrics tracking
+	type stressResult struct {
+		workerID   int
+		reqNum     int
+		reqType    string
+		e2e        time.Duration
+		ttft       time.Duration
+		throughput float64
+		tokens     int
+		err        error
+	}
+
+	resultsChan := make(chan stressResult, 10000)
+	var workerWg sync.WaitGroup
+
+	// Progress reporting ticker
+	progressTicker := time.NewTicker(10 * time.Second)
+	defer progressTicker.Stop()
+
+	// Atomic counters for progress reporting
+	var totalRequests, successCount, failureCount int64
+
+	// Start progress reporter
+	progressDone := make(chan bool)
+	go func() {
+		for {
+			select {
+			case <-progressTicker.C:
+				elapsed := time.Since(sessionStartTime)
+				rps := float64(totalRequests) / elapsed.Seconds()
+				providerLogger.Printf("[STRESS PROGRESS] Workers: %d | Total: %d | Success: %d | Failed: %d | RPS: %.2f",
+					numWorkers, totalRequests, successCount, failureCount, rps)
+			case <-progressDone:
+				return
+			}
+		}
+	}()
+
+	// Start workers with gradual ramp-up
+	workersPerSecond := float64(numWorkers) / float64(rampUpSec)
+	providerLogger.Printf("Ramping up: spawning %.1f workers/second over %d seconds...", workersPerSecond, rampUpSec)
+
+	for workerID := 1; workerID <= numWorkers; workerID++ {
+		workerWg.Add(1)
+		go func(id int) {
+			defer workerWg.Done()
+
+			// Each worker gets its own seeded RNG for proper randomization
+			//nolint:gosec // Not security-critical; using math/rand for performance
+			rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(id)))
+			reqNum := 0
+
+			for {
+				select {
+				case <-sessionCtx.Done():
+					return
+				default:
+					// Check if session duration has elapsed
+					if time.Since(sessionStartTime) >= sessionDuration {
+						return
+					}
+				}
+
+				reqNum++
+
+				// Determine request type based on weights using proper RNG
+				randVal := rng.Float64() * totalWeight
+
+				var reqType string
+				var reqTimeout time.Duration
+				var testFunc func(context.Context) (time.Duration, time.Duration, float64, int, string, error)
+
+				switch {
+				case randVal < streamingWeight:
+					reqType = "short"
+					reqTimeout = 60 * time.Second
+					testFunc = func(ctx context.Context) (time.Duration, time.Duration, float64, int, string, error) {
+						return singleTestRun(ctx, config, tke, providerLogger)
+					}
+				case randVal < streamingWeight+toolWeight:
+					reqType = "tool"
+					reqTimeout = 60 * time.Second
+					testFunc = func(ctx context.Context) (time.Duration, time.Duration, float64, int, string, error) {
+						return singleToolCallRun(ctx, config, tke, providerLogger, false)
+					}
+				default:
+					reqType = "long"
+					reqTimeout = 10 * time.Minute
+					testFunc = func(ctx context.Context) (time.Duration, time.Duration, float64, int, string, error) {
+						return longStoryRun(ctx, config, tke, providerLogger)
+					}
+				}
+
+				// Create timeout context for this request
+				reqCtx, reqCancel := context.WithTimeout(sessionCtx, reqTimeout)
+
+				e2e, ttft, throughput, tokens, _, reqErr := testFunc(reqCtx)
+				reqCancel()
+
+				resultsChan <- stressResult{
+					workerID:   id,
+					reqNum:     reqNum,
+					reqType:    reqType,
+					e2e:        e2e,
+					ttft:       ttft,
+					throughput: throughput,
+					tokens:     tokens,
+					err:        reqErr,
+				}
+			}
+		}(workerID)
+
+		// Rate limit worker spawning during ramp-up
+		if workerID < numWorkers {
+			time.Sleep(time.Duration(float64(time.Second) / workersPerSecond))
+		}
+	}
+
+	providerLogger.Printf("All %d workers spawned - ramp-up complete", numWorkers)
+	rampUpComplete <- true
+
+	// Wait for all workers to complete
+	go func() {
+		workerWg.Wait()
+		close(resultsChan)
+		close(progressDone)
+	}()
+
+	// Collect results with per-type statistics
+	var allE2E []time.Duration
+	var totalE2E, totalTTFT time.Duration
+	var totalThroughput float64
+	var totalTokens int
+	perTypeStats := make(map[string]RequestTypeStats)
+
+	errors := make(map[string]int)
+
+	for result := range resultsChan {
+		totalRequests++
+		if result.err != nil {
+			failureCount++
+			errors[result.err.Error()]++
+		} else {
+			successCount++
+			totalE2E += result.e2e
+			totalTTFT += result.ttft
+			totalThroughput += result.throughput
+			totalTokens += result.tokens
+			allE2E = append(allE2E, result.e2e)
+
+			// Update per-type stats
+			stats := perTypeStats[result.reqType]
+			stats.Count++
+			stats.Successful++
+			stats.TotalTokens += result.tokens
+			perTypeStats[result.reqType] = stats
+		}
+	}
+
+	// Calculate statistics
+	totalReqs := int(totalRequests)
+	successful := int(successCount)
+	failed := int(failureCount)
+
+	providerLogger.Println("")
+	providerLogger.Println("========================================")
+	providerLogger.Println("   HIGH-STRESS MODE SUMMARY")
+	providerLogger.Println("========================================")
+	providerLogger.Printf("Provider: %s", config.Name)
+	providerLogger.Printf("Model: %s", config.Model)
+	providerLogger.Printf("Workers: %d", numWorkers)
+	providerLogger.Printf("Duration: %s", formatDuration(time.Since(sessionStartTime)))
+	providerLogger.Printf("Total Requests: %d", totalReqs)
+	providerLogger.Printf("Successful: %d (%.1f%%)", successful, 100.0*float64(successful)/float64(totalReqs))
+	providerLogger.Printf("Failed: %d (%.1f%%)", failed, 100.0*float64(failed)/float64(totalReqs))
+
+	// Show per-type distribution
+	providerLogger.Println("----------------------------------------")
+	providerLogger.Println("Request Type Distribution:")
+	for reqType, stats := range perTypeStats {
+		if stats.Count > 0 {
+			providerLogger.Printf("  %s: %d requests (%d successful)", reqType, stats.Count, stats.Successful)
+		}
+	}
+
+	var avgE2E, avgTTFT time.Duration
+	var avgThroughput, rps float64
+	var p50, p95, p99 time.Duration
+
+	if successful > 0 {
+		avgE2E = totalE2E / time.Duration(successful)
+		avgTTFT = totalTTFT / time.Duration(successful)
+		avgThroughput = totalThroughput / float64(successful)
+		elapsed := time.Since(sessionStartTime)
+		rps = float64(totalReqs) / elapsed.Seconds()
+
+		// Calculate percentiles
+		p50 = calculatePercentile(allE2E, 50)
+		p95 = calculatePercentile(allE2E, 95)
+		p99 = calculatePercentile(allE2E, 99)
+
+		providerLogger.Println("----------------------------------------")
+		providerLogger.Printf("Avg E2E Latency: %s", formatDuration(avgE2E))
+		providerLogger.Printf("P50 E2E: %s", formatDuration(p50))
+		providerLogger.Printf("P95 E2E: %s", formatDuration(p95))
+		providerLogger.Printf("P99 E2E: %s", formatDuration(p99))
+		providerLogger.Printf("Avg TTFT: %s", formatDuration(avgTTFT))
+		providerLogger.Printf("Avg Throughput: %.2f tokens/s", avgThroughput)
+		providerLogger.Printf("Total Tokens: %d", totalTokens)
+		providerLogger.Printf("Requests/sec: %.2f", rps)
+	}
+
+	if len(errors) > 0 {
+		providerLogger.Println("----------------------------------------")
+		providerLogger.Println("Errors encountered:")
+		for errMsg, count := range errors {
+			providerLogger.Printf("  - %s (x%d)", errMsg, count)
+		}
+	}
+
+	providerLogger.Println("========================================")
+
+	// Create stress summary
+	summary := StressSummary{
+		Provider:        config.Name,
+		Model:           config.Model,
+		Timestamp:       time.Now(),
+		Workers:         numWorkers,
+		DurationSeconds: durationSec,
+		TotalRequests:   totalReqs,
+		Successful:      successful,
+		Failed:          failed,
+		TotalTokens:     totalTokens,
+		RequestsPerSec:  rps,
+	}
+
+	if successful > 0 {
+		summary.AvgE2ELatency = avgE2E
+		summary.P50E2E = p50
+		summary.P95E2E = p95
+		summary.P99E2E = p99
+		summary.AvgTTFT = avgTTFT
+		summary.AvgThroughput = avgThroughput
+
+		if targetTokens > 0 {
+			summary.ProjectedE2E = calculateProjectedE2E(avgTTFT, avgThroughput, targetTokens)
+		}
+	}
+
+	if len(errors) > 0 {
+		summary.Errors = errors
+	}
+
+	// Save stress summary to JSON
+	summaryFile := filepath.Join(resultsDir, fmt.Sprintf("%s-stress-summary-%s.json", config.Name, timestamp))
+	data, err := json.MarshalIndent(summary, "", "  ")
+	if err != nil {
+		providerLogger.Printf("Warning: Failed to marshal stress summary: %v", err)
+	} else {
+		if err := os.WriteFile(summaryFile, data, 0600); err != nil {
+			providerLogger.Printf("Warning: Failed to write stress summary: %v", err)
+		} else {
+			providerLogger.Printf("Stress summary saved: %s", summaryFile)
+		}
+	}
+
+	// Append to results slice if provided
+	if results != nil && resultsMutex != nil {
+		resultsMutex.Lock()
+		*results = append(*results, summary)
+		resultsMutex.Unlock()
+	}
+
+	// Print formatted terminal summary
+	printStressSummary(summary, perTypeStats, config)
 }
 
 // generateDiagnosticReport creates a markdown report for diagnostic mode results.
@@ -1536,6 +2620,163 @@ func generateDiagnosticReport(resultsDir string, results []DiagnosticSummary, se
 	return nil
 }
 
+// calculatePercentile calculates the P-th percentile from a slice of durations.
+func calculatePercentile(values []time.Duration, percentile float64) time.Duration {
+	if len(values) == 0 {
+		return 0
+	}
+	// Sort the values
+	sorted := make([]time.Duration, len(values))
+	copy(sorted, values)
+	for i := 0; i < len(sorted); i++ {
+		for j := i + 1; j < len(sorted); j++ {
+			if sorted[j] < sorted[i] {
+				sorted[i], sorted[j] = sorted[j], sorted[i]
+			}
+		}
+	}
+	index := int(float64(len(sorted)-1) * percentile / 100.0)
+	return sorted[index]
+}
+
+// generateStressReport creates a markdown report for stress mode results.
+func generateStressReport(resultsDir string, results []StressSummary, sessionTimestamp string) error {
+	filename := filepath.Join(resultsDir, "STRESS-REPORT.md")
+
+	var report strings.Builder
+	report.WriteString("# LLM API High-Stress Mode Results\n\n")
+	report.WriteString(fmt.Sprintf("**Test Session:** %s\n\n", sessionTimestamp))
+	report.WriteString("**Test Type:** High-Concurrency Stress Test\n\n")
+	report.WriteString("---\n\n")
+
+	// Summary statistics
+	totalProviders := len(results)
+	var totalRequests, totalSuccessful, totalFailed int
+	var totalTokens int
+	var totalRPS float64
+
+	for _, r := range results {
+		totalRequests += r.TotalRequests
+		totalSuccessful += r.Successful
+		totalFailed += r.Failed
+		totalTokens += r.TotalTokens
+		totalRPS += r.RequestsPerSec
+	}
+
+	report.WriteString("## Summary\n\n")
+	report.WriteString(fmt.Sprintf("- **Providers Tested:** %d\n", totalProviders))
+	report.WriteString(fmt.Sprintf("- **Total Requests:** %d\n", totalRequests))
+	report.WriteString(fmt.Sprintf("- **Successful:** %d (%.1f%%)\n",
+		totalSuccessful, 100.0*float64(totalSuccessful)/float64(totalRequests)))
+	report.WriteString(fmt.Sprintf("- **Failed:** %d (%.1f%%)\n\n",
+		totalFailed, 100.0*float64(totalFailed)/float64(totalRequests)))
+	report.WriteString(fmt.Sprintf("- **Total Tokens Generated:** %d\n", totalTokens))
+	report.WriteString(fmt.Sprintf("- **Aggregate RPS:** %.2f\n\n", totalRPS))
+
+	// Detailed results table
+	if len(results) > 0 {
+		report.WriteString("## Detailed Results\n\n")
+		report.WriteString("| Provider | Workers | Duration | Total | Success | Failed | Avg E2E | P95 E2E | RPS | Throughput |\n")
+		report.WriteString("|----------|---------|----------|-------|---------|--------|---------|---------|-----|------------|\n")
+
+		for _, r := range results {
+			successRate := fmt.Sprintf("%.1f%%", 100.0*float64(r.Successful)/float64(r.TotalRequests))
+			report.WriteString(fmt.Sprintf("| %s | %d | %ds | %d | %s | %d | %s | %s | %.2f | %.2f tok/s |\n",
+				r.Provider,
+				r.Workers,
+				r.DurationSeconds,
+				r.TotalRequests,
+				successRate,
+				r.Failed,
+				formatDuration(r.AvgE2ELatency),
+				formatDuration(r.P95E2E),
+				r.RequestsPerSec,
+				r.AvgThroughput))
+		}
+		report.WriteString("\n")
+	}
+
+	// Performance Leaderboard
+	if len(results) > 0 {
+		report.WriteString("## Performance Leaderboards\n\n")
+
+		// By RPS
+		report.WriteString("### By Requests Per Second\n\n")
+		sortedResults := make([]StressSummary, len(results))
+		copy(sortedResults, results)
+		for i := 0; i < len(sortedResults); i++ {
+			for j := i + 1; j < len(sortedResults); j++ {
+				if sortedResults[j].RequestsPerSec > sortedResults[i].RequestsPerSec {
+					sortedResults[i], sortedResults[j] = sortedResults[j], sortedResults[i]
+				}
+			}
+		}
+
+		report.WriteString("| Rank | Provider | RPS | Workers | Success Rate |\n")
+		report.WriteString("|------|----------|-----|---------|-------------|\n")
+		for i, r := range sortedResults {
+			successRate := fmt.Sprintf("%.1f%%", 100.0*float64(r.Successful)/float64(r.TotalRequests))
+			report.WriteString(fmt.Sprintf("| %d | %s | %.2f | %d | %s |\n",
+				i+1, r.Provider, r.RequestsPerSec, r.Workers, successRate))
+		}
+		report.WriteString("\n")
+
+		// By Throughput
+		report.WriteString("### By Token Throughput\n\n")
+		for i := 0; i < len(sortedResults); i++ {
+			for j := i + 1; j < len(sortedResults); j++ {
+				if sortedResults[j].AvgThroughput > sortedResults[i].AvgThroughput {
+					sortedResults[i], sortedResults[j] = sortedResults[j], sortedResults[i]
+				}
+			}
+		}
+
+		report.WriteString("| Rank | Provider | Throughput | Total Tokens | Avg E2E |\n")
+		report.WriteString("|------|----------|------------|--------------|--------|\n")
+		for i, r := range sortedResults {
+			report.WriteString(fmt.Sprintf("| %d | %s | %.2f tok/s | %d | %s |\n",
+				i+1, r.Provider, r.AvgThroughput, r.TotalTokens, formatDuration(r.AvgE2ELatency)))
+		}
+		report.WriteString("\n")
+	}
+
+	// Error Analysis
+	hasErrors := false
+	for _, r := range results {
+		if len(r.Errors) > 0 {
+			hasErrors = true
+			break
+		}
+	}
+
+	if hasErrors {
+		report.WriteString("## Error Analysis\n\n")
+
+		for _, r := range results {
+			if len(r.Errors) > 0 {
+				report.WriteString(fmt.Sprintf("### %s Errors\n\n", r.Provider))
+				report.WriteString("| Error | Count |\n")
+				report.WriteString("|-------|-------|\n")
+
+				for errMsg, count := range r.Errors {
+					report.WriteString(fmt.Sprintf("| %s | %d |\n", errMsg, count))
+				}
+				report.WriteString("\n")
+			}
+		}
+	}
+
+	report.WriteString("---\n\n")
+	report.WriteString(fmt.Sprintf("*Report generated at %s*\n", time.Now().Format("2006-01-02 15:04:05")))
+
+	if err := os.WriteFile(filename, []byte(report.String()), 0600); err != nil {
+		return fmt.Errorf("error writing stress report: %w", err)
+	}
+
+	log.Printf("Stress report generated: %s", filename)
+	return nil
+}
+
 func main() {
 	// --- Define Provider static info ---
 	providerBaseURLs := map[string]string{
@@ -1565,6 +2806,17 @@ func main() {
 	diagnostic := flag.Bool("diagnostic", false,
 		"Run diagnostic mode: 10 workers making requests every 15s for 1 minute with 30s timeout")
 	longStory := flag.Bool("long-story", false, "Use long-form story generation scenario (single creative-writing prompt)")
+	stress := flag.Bool("stress", false, "Run high-stress mode: high concurrency mixed load testing")
+	stressLevel := flag.String("stress-level", "moderate",
+		"Stress level preset: moderate (100 workers), heavy (500), extreme (1000)")
+	stressWorkers := flag.Int("stress-workers", 0,
+		"Override: exact number of workers for stress mode (ignores --stress-level)")
+	stressDuration := flag.Int("stress-duration", 300,
+		"Stress test duration in seconds (default: 300 = 5 minutes)")
+	stressLongBias := flag.Int("stress-long-bias", 30,
+		"Percentage of long-form requests in stress mode (default: 30, range: 10-80)")
+	stressRampUp := flag.Int("stress-rampup", 10,
+		"Seconds to gradually spawn workers (default: 10)")
 	flagToolReasoningCheck := flag.Bool("tool-reasoning-check", false,
 		"Enable tool+reasoning behavior checks (implies tool-calling if not otherwise set)")
 	flagSaveResponses := flag.Bool("save-responses", false, "Save all API responses to log files")
@@ -1581,6 +2833,12 @@ func main() {
 
 	if *diagnostic && *longStory {
 		log.Fatal("Error: --long-story cannot be combined with --diagnostic")
+	}
+	if *stress && *longStory {
+		log.Fatal("Error: --long-story cannot be combined with --stress")
+	}
+	if *stress && *diagnostic {
+		log.Fatal("Error: --stress cannot be combined with --diagnostic")
 	}
 
 	// 3. Create session-based folder structure
@@ -1750,6 +3008,8 @@ func main() {
 		log.Println("Test mode: Tool-calling")
 	case ModeStreaming:
 		log.Println("Test mode: Streaming")
+	case ModeStress:
+		log.Println("Test mode: Stress (handled separately)")
 	default:
 		log.Printf("Test mode: %s", testMode)
 	}
@@ -1796,6 +3056,46 @@ func main() {
 		log.Printf("Diagnostic tests complete. Results saved to: %s/", sessionDir)
 		return
 	}
+
+	if *stress {
+		// Determine worker count and validate stress mode settings
+		numWorkers := resolveStressWorkers(*stress, *stressWorkers, *stressLevel)
+		validateStressSettings(numWorkers, *stressDuration, *stressLongBias, *stressRampUp)
+
+		log.Printf("=== RUNNING IN HIGH-STRESS MODE ===")
+		log.Printf("Workers: %d | Duration: %ds | Long-form bias: %d%% | Ramp-up: %ds",
+			numWorkers, *stressDuration, *stressLongBias, *stressRampUp)
+
+		var stressResults []StressSummary
+		var stressMutex sync.Mutex
+
+		if len(providersToTest) > 1 {
+			// Run multiple providers concurrently
+			var stressWg sync.WaitGroup
+			for _, provider := range providersToTest {
+				stressWg.Add(1)
+				go stressMode(provider, tke, logDir, resultsDir, numWorkers, *stressDuration, *stressLongBias, *stressRampUp, &stressWg, &stressResults, &stressMutex)
+			}
+			stressWg.Wait()
+		} else {
+			// Single provider (no concurrency needed)
+			for _, provider := range providersToTest {
+				stressMode(provider, tke, logDir, resultsDir, numWorkers, *stressDuration, *stressLongBias, *stressRampUp, nil, &stressResults, &stressMutex)
+			}
+		}
+
+		log.Println("--- All stress tests complete. ---")
+
+		// Generate stress report
+		log.Println("Generating stress summary report...")
+		if err := generateStressReport(resultsDir, stressResults, sessionTimestamp); err != nil {
+			log.Printf("Warning: Failed to generate stress report: %v", err)
+		}
+
+		log.Printf("Stress tests complete. Results saved to: %s/", sessionDir)
+		return
+	}
+
 	var wg sync.WaitGroup
 	var results []TestResult
 	var resultsMutex sync.Mutex
